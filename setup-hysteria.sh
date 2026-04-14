@@ -425,6 +425,32 @@ install_hysteria() {
   bash <(curl -fsSL https://get.hy2.sh/)
 }
 
+sync_tls_certs_for_hysteria() {
+  log "Copying TLS material for hysteria user (not readable from /etc/letsencrypt/live by non-root)..."
+
+  if ! id -u hysteria >/dev/null 2>&1; then
+    err "User hysteria not found after install; cannot deploy cert copies."
+    exit 1
+  fi
+
+  local le_dir="/etc/letsencrypt/live/${DOMAIN}"
+  if [[ ! -r "${le_dir}/fullchain.pem" ]] || [[ ! -r "${le_dir}/privkey.pem" ]]; then
+    err "Missing or unreadable certs under ${le_dir}"
+    exit 1
+  fi
+
+  mkdir -p /etc/hysteria/certs
+
+  cp -f "${le_dir}/fullchain.pem" /etc/hysteria/certs/fullchain.pem
+  cp -f "${le_dir}/privkey.pem" /etc/hysteria/certs/privkey.pem
+
+  chown -R hysteria:hysteria /etc/hysteria/certs
+  chmod 755 /etc/hysteria
+  chmod 755 /etc/hysteria/certs
+  chmod 640 /etc/hysteria/certs/fullchain.pem
+  chmod 640 /etc/hysteria/certs/privkey.pem
+}
+
 write_hysteria_config() {
   log "Writing Hysteria config..."
   mkdir -p /etc/hysteria
@@ -433,8 +459,8 @@ write_hysteria_config() {
 listen: :${PORT}
 
 tls:
-  cert: /etc/letsencrypt/live/${DOMAIN}/fullchain.pem
-  key: /etc/letsencrypt/live/${DOMAIN}/privkey.pem
+  cert: /etc/hysteria/certs/fullchain.pem
+  key: /etc/hysteria/certs/privkey.pem
 
 auth:
   type: password
@@ -451,6 +477,10 @@ masquerade:
     url: https://${DOMAIN}
     rewriteHost: true
 EOF
+
+  echo "===== /etc/hysteria/config.yaml ====="
+  cat /etc/hysteria/config.yaml
+  echo "====================================="
 }
 
 ensure_hysteria_restart_policy() {
@@ -469,17 +499,42 @@ start_hysteria() {
   log "Starting Hysteria..."
   systemctl enable hysteria-server
   systemctl restart hysteria-server
+  sleep 2
 }
 
 verify_services() {
   log "Verifying nginx..."
   systemctl is-active --quiet nginx || { err "nginx is not active"; exit 1; }
 
-  log "Verifying hysteria..."
-  systemctl is-active --quiet hysteria-server || { err "hysteria-server is not active"; exit 1; }
+  log "Verifying hysteria-server is active..."
+  if ! systemctl is-active --quiet hysteria-server; then
+    err "hysteria-server is not active"
+    echo "===== journalctl -u hysteria-server (last 30) ====="
+    journalctl -u hysteria-server -n 30 --no-pager -l || true
+    exit 1
+  fi
 
-  log "Checking listening ports..."
-  ss -tulnp | grep -E ":80|:443|:${PORT}" || true
+  log "Verifying UDP listener on port ${PORT}..."
+  if ! ss -ulnp | grep -q ":${PORT}"; then
+    err "No UDP listener found on port ${PORT}"
+    echo "===== Hysteria status ====="
+    systemctl status hysteria-server --no-pager -l || true
+    echo "===== journalctl -u hysteria-server (last 30) ====="
+    journalctl -u hysteria-server -n 30 --no-pager -l || true
+    echo "===== UDP listeners ====="
+    ss -ulnp || true
+    exit 1
+  fi
+
+  echo "===== Hysteria status ====="
+  systemctl status hysteria-server --no-pager -l || true
+  echo "===== Hysteria logs (last 30) ====="
+  journalctl -u hysteria-server -n 30 --no-pager -l || true
+  echo "===== UDP listeners (port ${PORT}) ====="
+  ss -ulnp | grep ":${PORT}" || true
+
+  log "Checking HTTP/HTTPS ports..."
+  ss -tulnp | grep -E ':80|:443' || true
 }
 
 print_summary() {
@@ -494,8 +549,10 @@ print_summary() {
   echo "Hysteria server:     ${DOMAIN}:${PORT}"
   echo "Password:            ${PASSWORD}"
   echo "TLS SNI:             ${DOMAIN}"
-  echo "Cert path:           /etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
-  echo "Key path:            /etc/letsencrypt/live/${DOMAIN}/privkey.pem"
+  echo "Nginx (LE) cert:     /etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
+  echo "Nginx (LE) key:      /etc/letsencrypt/live/${DOMAIN}/privkey.pem"
+  echo "Hysteria TLS cert:   /etc/hysteria/certs/fullchain.pem"
+  echo "Hysteria TLS key:    /etc/hysteria/certs/privkey.pem"
   echo
   echo "Suggested Surge node:"
   echo "  Protocol:          Hysteria 2"
@@ -523,6 +580,7 @@ main() {
   issue_certificate
   write_https_site
   install_hysteria
+  sync_tls_certs_for_hysteria
   write_hysteria_config
   ensure_hysteria_restart_policy
   start_hysteria
