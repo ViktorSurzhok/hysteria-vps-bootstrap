@@ -54,8 +54,8 @@ sudo bash setup-hysteria.sh \
 
 ```bash
 sudo bash setup-hysteria.sh \
-  --domain static.lamp-labs.pro \
-  --email admin@static.lamp-labs.pro \
+  --domain node.example.com \
+  --email admin@node.example.com \
   --password 'your-secure-password' \
   --port 8443 \
   --site-title "Сервер работает нормально."
