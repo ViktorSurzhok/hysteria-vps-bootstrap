@@ -30,8 +30,8 @@ This repository ships a single, opinionated shell script that turns a blank **Ub
 
 ## Website (опционально)
 
-Если есть отдельный лендинг или документация — укажите URL. Иначе можно оставить пустым или поставить ссылку на сырой скрипт:
+Репозиторий: [https://github.com/ViktorSurzhok/hysteria-vps-bootstrap](https://github.com/ViktorSurzhok/hysteria-vps-bootstrap)
 
-`https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/hysteria-vps-bootstrap/main/setup-hysteria.sh`
+Прямая ссылка на скрипт (удобно вставить в поле **Website** на GitHub):
 
-(замените `YOUR_GITHUB_USERNAME`.)
+`https://raw.githubusercontent.com/ViktorSurzhok/hysteria-vps-bootstrap/main/setup-hysteria.sh`

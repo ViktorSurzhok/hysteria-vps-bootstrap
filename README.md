@@ -2,6 +2,8 @@
 
 Быстрый bootstrap-скрипт для развёртывания **Hysteria 2** + **Nginx** + **Let's Encrypt** + статусной HTML-страницы на чистом VPS (Ubuntu/Debian, `apt`).
 
+Исходники и issues: [github.com/ViktorSurzhok/hysteria-vps-bootstrap](https://github.com/ViktorSurzhok/hysteria-vps-bootstrap).
+
 ## Что делает скрипт
 
 - ставит `nginx`, `certbot`, базовые утилиты и `ufw`
@@ -18,7 +20,8 @@
 
 - чистый **Ubuntu/Debian** VPS с `apt-get`
 - **root** (или `sudo`)
-- домен уже указывает на IP VPS через **A** запись
+- **DNS заранее:** у домена (или поддомена), который передаёте в `--domain`, должна быть **A-запись на публичный IP этого VPS** до запуска скрипта. Иначе Let's Encrypt не сможет проверить владение доменом, а выпуск сертификата завершится ошибкой.
+- **Email для `--email`:** укажите **реальный почтовый ящик на вашем домене** (тот же домен, что и у сайта/Hysteria), куда Let's Encrypt присылает уведомления о сертификате. Например, при `--domain static.example.com` логично указать `admin@static.example.com` или `admin@example.com`, если почта на корневом домене настроена и вы её читаете.
 - на стороне облака/хостинга открыты порты:
   - `22/tcp`
   - `80/tcp`
@@ -30,7 +33,7 @@
 ```bash
 sudo bash setup-hysteria.sh \
   --domain static.example.com \
-  --email admin@example.com \
+  --email admin@static.example.com \
   --password 'StrongPasswordHere' \
   --port 8443 \
   --site-title "Инфраструктурный узел активен."
@@ -41,7 +44,7 @@ sudo bash setup-hysteria.sh \
 | Параметр      | Обязательный | Описание                          |
 |---------------|--------------|-----------------------------------|
 | `--domain`    | да           | домен для сайта и TLS           |
-| `--email`     | да           | email для Let's Encrypt         |
+| `--email`     | да           | рабочий email **на вашем домене** для Let's Encrypt (см. раздел «Требования») |
 | `--password`  | да           | пароль для Hysteria             |
 | `--port`      | нет          | UDP-порт Hysteria (по умолчанию 8443) |
 | `--webroot`   | нет          | путь к корню сайта              |
@@ -52,7 +55,7 @@ sudo bash setup-hysteria.sh \
 ```bash
 sudo bash setup-hysteria.sh \
   --domain static.lamp-labs.pro \
-  --email you@example.com \
+  --email admin@static.lamp-labs.pro \
   --password 'your-secure-password' \
   --port 8443 \
   --site-title "Сервер работает нормально."
@@ -98,14 +101,14 @@ ss -tulnp | grep -E ':80|:443|:8443'
 
 ## One-liner с GitHub
 
-Подставьте свой пользователь/организацию вместо `YOUR_GITHUB_USERNAME`.
+Скрипт с ветки `main` репозитория [ViktorSurzhok/hysteria-vps-bootstrap](https://github.com/ViktorSurzhok/hysteria-vps-bootstrap):
 
 **curl**
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/hysteria-vps-bootstrap/main/setup-hysteria.sh) \
+bash <(curl -fsSL https://raw.githubusercontent.com/ViktorSurzhok/hysteria-vps-bootstrap/main/setup-hysteria.sh) \
   --domain static.example.com \
-  --email admin@example.com \
+  --email admin@static.example.com \
   --password 'StrongPasswordHere' \
   --port 8443
 ```
@@ -113,9 +116,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/hysteri
 **wget**
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/hysteria-vps-bootstrap/main/setup-hysteria.sh) \
+bash <(wget -qO- https://raw.githubusercontent.com/ViktorSurzhok/hysteria-vps-bootstrap/main/setup-hysteria.sh) \
   --domain static.example.com \
-  --email admin@example.com \
+  --email admin@static.example.com \
   --password 'StrongPasswordHere' \
   --port 8443
 ```
