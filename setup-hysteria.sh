@@ -681,12 +681,12 @@ print_summary() {
   printf 'Hysteria key:        %s\n' "$HYSTERIA_KEY_PATH"
   printf 'Config:              /etc/hysteria/config.yaml (mode 640, root:hysteria)\n'
   printf 'Backup of old cfgs:  %s\n' "$BACKUP_DIR"
-  printf 'Password:            %s  (hidden; recorded on the host only)\n' "$(mask_secret "$PASSWORD")"
+  printf 'Password:            %s\n' "$PASSWORD"
   printf '\nSuggested Surge / client node:\n'
   printf '  Protocol:          Hysteria 2\n'
   printf '  Server Address:    %s\n' "${public_ip:-$DOMAIN}"
   printf '  Port:              %s\n' "$PORT"
-  printf '  Password:          (see your password store or --password-file)\n'
+  printf '  Password:          %s\n' "$PASSWORD"
   printf '  Custom TLS SNI:    %s\n' "$DOMAIN"
   printf '\nUseful checks:\n'
   printf '  systemctl status hysteria-server --no-pager -l\n'
