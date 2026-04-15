@@ -451,6 +451,33 @@ sync_tls_certs_for_hysteria() {
   chmod 640 /etc/hysteria/certs/privkey.pem
 }
 
+install_certbot_deploy_hook_for_hysteria() {
+  log "Installing Certbot deploy hook (refresh Hysteria TLS copies after LE renewal)..."
+  mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+  local hook_path="/etc/letsencrypt/renewal-hooks/deploy/hysteria-sync-${DOMAIN}.sh"
+  cat >"${hook_path}" <<HOOK
+#!/bin/sh
+set -eu
+# Certbot sets RENEWED_LINEAGE for deploy hooks; ignore unrelated lineages.
+if [ "\${RENEWED_LINEAGE:-}" != "/etc/letsencrypt/live/${DOMAIN}" ]; then
+  exit 0
+fi
+LE_DIR="/etc/letsencrypt/live/${DOMAIN}"
+if [ ! -r "\${LE_DIR}/fullchain.pem" ] || [ ! -r "\${LE_DIR}/privkey.pem" ]; then
+  exit 1
+fi
+mkdir -p /etc/hysteria/certs
+cp -f "\${LE_DIR}/fullchain.pem" /etc/hysteria/certs/fullchain.pem
+cp -f "\${LE_DIR}/privkey.pem" /etc/hysteria/certs/privkey.pem
+chown -R hysteria:hysteria /etc/hysteria/certs
+chmod 755 /etc/hysteria
+chmod 755 /etc/hysteria/certs
+chmod 640 /etc/hysteria/certs/fullchain.pem /etc/hysteria/certs/privkey.pem
+systemctl reload-or-restart hysteria-server
+HOOK
+  chmod +x "${hook_path}"
+}
+
 write_hysteria_config() {
   log "Writing Hysteria config..."
   mkdir -p /etc/hysteria
@@ -581,6 +608,7 @@ main() {
   write_https_site
   install_hysteria
   sync_tls_certs_for_hysteria
+  install_certbot_deploy_hook_for_hysteria
   write_hysteria_config
   ensure_hysteria_restart_policy
   start_hysteria
