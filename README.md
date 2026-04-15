@@ -1,73 +1,73 @@
 # Hysteria VPS Bootstrap
 
-Production-grade bootstrap script for **Hysteria 2 + Nginx + Let's Encrypt + status page** on a clean Debian/Ubuntu VPS.
+Прод-скрипт для развёртывания **Hysteria 2 + Nginx + Let's Encrypt + статусной страницы** на чистом Debian/Ubuntu VPS.
 
-One shell file, idempotent re-runs, hardened TLS, DNS preflight, automatic backups of existing configs, and two supported ways of delivering TLS material to the `hysteria` user.
+Один shell-файл, идемпотентные повторные запуски, хардененный TLS, DNS-preflight, автоматический бэкап существующих конфигов и два способа доставки TLS-материала до пользователя `hysteria`.
 
-Source and issues: [github.com/ViktorSurzhok/hysteria-vps-bootstrap](https://github.com/ViktorSurzhok/hysteria-vps-bootstrap).
-
----
-
-## Table of contents
-
-- [What the script does](#what-the-script-does)
-- [Requirements](#requirements)
-- [Quick start](#quick-start)
-- [CLI reference](#cli-reference)
-- [Secrets handling](#secrets-handling)
-- [Certificate delivery modes](#certificate-delivery-modes)
-- [Idempotency and re-runs](#idempotency-and-re-runs)
-- [What gets hardened](#what-gets-hardened)
-- [Backups and recovery](#backups-and-recovery)
-- [Verification](#verification)
-- [Client configuration (Surge / others)](#client-configuration)
-- [Troubleshooting](#troubleshooting)
-- [Security notes](#security-notes)
-- [Uninstall](#uninstall)
-- [License](#license)
+Исходники и issues: [github.com/ViktorSurzhok/hysteria-vps-bootstrap](https://github.com/ViktorSurzhok/hysteria-vps-bootstrap).
 
 ---
 
-## What the script does
+## Оглавление
 
-1. Installs base packages: `nginx`, `certbot`, `python3-certbot-nginx`, `ufw`, `dnsutils`, `openssl`, `jq`, plus `acl` when `--cert-mode acl`.
-2. **DNS preflight.** Resolves all A records for the domain via `1.1.1.1`, fetches the VPS public IPv4, and fails fast if they do not match — so you never hit a Let's Encrypt rate limit because of a misconfigured DNS record.
-3. **Backs up** existing `/etc/nginx`, `/etc/hysteria`, and Let's Encrypt renewal metadata to `/root/hysteria-vps-bootstrap-backup-<timestamp>/` before touching anything.
-4. Configures **UFW** (`22/tcp`, `80/tcp`, `443/tcp`, `<port>/udp`), verifies the SSH rule is queued before enabling the firewall, and refuses to enable it otherwise.
-5. Writes an HTTP vhost, brings up a minimal status page, and runs `nginx -t` before every reload.
-6. Issues a Let's Encrypt certificate via `certbot --nginx`. **Idempotent:** if a valid cert with more than 30 days of life already exists, issuance is skipped (unless `--force-renew` is passed).
-7. Replaces the vhost with a **hardened HTTPS config**: TLS 1.2 + 1.3, modern AEAD ciphers, OCSP stapling, HSTS, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`.
-8. Installs **Hysteria 2** via the upstream installer (fetched to a temp file, sanity-checked to be a shell script before exec).
-9. Delivers TLS material to the `hysteria` user using either the **copy** or **ACL** mode (see below), and in both cases installs a certbot deploy-hook so renewals stay in sync.
-10. Writes `/etc/hysteria/config.yaml` with `mode 640 root:hysteria`, using `umask 077` so the file never exists world-readable.
-11. Installs a systemd drop-in: `Restart=always`, `RestartSec=5`.
-12. **Verifies** nginx is active, hysteria-server is active, the UDP port is actually listening, the `hysteria` user can read the TLS files, and that `https://<domain>` responds.
-13. Prints a summary with the connection parameters and a masked password.
-
-All of this happens from a single `main()` that reads as a pipeline — if you want to remove a step, delete one line.
+- [Что делает скрипт](#что-делает-скрипт)
+- [Требования](#требования)
+- [Быстрый старт](#быстрый-старт)
+- [Справочник по CLI](#справочник-по-cli)
+- [Работа с секретами](#работа-с-секретами)
+- [Режимы доставки сертификатов](#режимы-доставки-сертификатов)
+- [Идемпотентность и повторные запуски](#идемпотентность-и-повторные-запуски)
+- [Что захарденено](#что-захарденено)
+- [Бэкапы и восстановление](#бэкапы-и-восстановление)
+- [Проверка](#проверка)
+- [Настройка клиента (Surge и другие)](#настройка-клиента)
+- [Диагностика проблем](#диагностика-проблем)
+- [Заметки по безопасности](#заметки-по-безопасности)
+- [Удаление](#удаление)
+- [Лицензия](#лицензия)
 
 ---
 
-## Requirements
+## Что делает скрипт
 
-Before running:
+1. Ставит базовые пакеты: `nginx`, `certbot`, `python3-certbot-nginx`, `ufw`, `dnsutils`, `openssl`, `jq`, плюс `acl` если выбран `--cert-mode acl`.
+2. **DNS-preflight.** Резолвит все A-записи домена через `1.1.1.1`, получает публичный IPv4 VPS и падает рано, если они не совпадают — чтобы вы никогда не ловили rate-limit от Let's Encrypt из-за кривой DNS-записи.
+3. **Бэкапит** существующие `/etc/nginx`, `/etc/hysteria` и метаданные renewal Let's Encrypt в `/root/hysteria-vps-bootstrap-backup-<timestamp>/` до того, как что-то трогает.
+4. Настраивает **UFW** (`22/tcp`, `80/tcp`, `443/tcp`, `<порт>/udp`), проверяет что правило для SSH поставлено в очередь **до** включения firewall и отказывается включать его иначе.
+5. Пишет HTTP vhost, поднимает минимальную статус-страницу и гоняет `nginx -t` перед каждым reload.
+6. Выпускает сертификат Let's Encrypt через `certbot --nginx`. **Идемпотентно:** если валидный сертификат с запасом больше 30 дней уже есть — выпуск пропускается (кроме случая с `--force-renew`).
+7. Заменяет vhost на **хардененный HTTPS-конфиг**: TLS 1.2 + 1.3, современные AEAD-cipher'ы, OCSP stapling, HSTS, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`.
+8. Ставит **Hysteria 2** через upstream-установщик (скачивает в temp-файл, проверяет что это shell-скрипт перед запуском).
+9. Доставляет TLS-материал пользователю `hysteria` через режим **copy** или **acl** (см. ниже) и в обоих случаях ставит certbot deploy-hook, чтобы после renewal всё осталось синхронно.
+10. Пишет `/etc/hysteria/config.yaml` в `mode 640 root:hysteria` под `umask 077` — файл никогда не существует world-readable даже на долю секунды.
+11. Ставит systemd drop-in: `Restart=always`, `RestartSec=5`.
+12. **Верифицирует:** nginx активен, hysteria-server активен, UDP-порт реально слушается, пользователь `hysteria` может прочитать TLS-файлы, `https://<domain>` отвечает.
+13. Печатает summary с параметрами подключения и замаскированным паролем.
 
-- A **clean Debian/Ubuntu** VPS with `apt-get`.
-- **root** (or `sudo`).
-- **DNS A record** for your domain pointing to the VPS public IPv4. The script will bail out early if this is wrong — don't rely on "propagation will happen later".
-- A **real email on your own domain** for `--email`. This is where Let's Encrypt will notify you about certificate expiry and CAA issues. Example: for `--domain node.example.com`, use `admin@example.com`.
-- Open in your cloud firewall:
+Всё это происходит из одного `main()`, который читается как pipeline — если какой-то шаг не нужен, удалите одну строку.
+
+---
+
+## Требования
+
+До запуска:
+
+- **Чистый Debian/Ubuntu** VPS с `apt-get`.
+- **root** (или `sudo`).
+- **DNS A-запись** для вашего домена, указывающая на публичный IPv4 VPS. Скрипт упадёт на preflight, если это не так — не надейтесь на «пропагация подъедет позже».
+- **Реальный email на вашем домене** для `--email`. Туда Let's Encrypt шлёт уведомления об истечении сертификата и проблемах с CAA. Пример: для `--domain node.example.com` ставьте `admin@example.com`.
+- В облачном firewall открыты:
   - `22/tcp`
   - `80/tcp`
   - `443/tcp`
-  - your chosen UDP port (default `8443/udp`)
+  - выбранный UDP-порт (по умолчанию `8443/udp`)
 
 ---
 
-## Quick start
+## Быстрый старт
 
 ```bash
-# Preferred: password from a file, never on the command line
+# Рекомендуемый способ: пароль из файла, а не из командной строки
 echo 'StrongPasswordHere' > /root/.hysteria.pw
 chmod 600 /root/.hysteria.pw
 
@@ -80,7 +80,7 @@ sudo bash setup-hysteria.sh \
   --site-title "Инфраструктурный узел активен."
 ```
 
-One-liner from GitHub (you still need to ship your own password file — we do not accept secrets on stdin piped from `curl` to avoid logging them in shell history):
+One-liner с GitHub (файл с паролем всё равно готовьте отдельно — мы сознательно не принимаем секреты через stdin от `curl`, чтобы они не попали в shell history):
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ViktorSurzhok/hysteria-vps-bootstrap/main/setup-hysteria.sh) \
@@ -92,131 +92,131 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ViktorSurzhok/hysteria-vps-b
 
 ---
 
-## CLI reference
+## Справочник по CLI
 
-| Flag | Required | Description |
+| Флаг | Обяз. | Описание |
 |---|---|---|
-| `--domain <fqdn>` | yes | Domain for the site, TLS SNI, and ACME challenge. Must already resolve to this VPS. |
-| `--email <addr>` | yes | Contact email for Let's Encrypt. Use your own domain. |
-| `--password <pw>` | one of | Hysteria 2 auth password. **Visible in `ps` and shell history** — prefer `--password-file`. |
-| `--password-file <path>` | one of | Read password from the first line of a file. `chmod 600` the file before running. |
-| `--port <udp>` | no | UDP port for Hysteria (default `8443`). Range 1–65535. |
-| `--webroot <path>` | no | Site root (default `/var/www/<domain>`). |
-| `--site-title <text>` | no | Subtitle on the status page. **HTML-escaped automatically** — you can put quotes and tags in there safely. |
-| `--cert-mode <copy\|acl>` | no | How Hysteria reads LE certs. Default: `copy`. See [Certificate delivery modes](#certificate-delivery-modes). |
-| `--force-renew` | no | Force certbot to reissue even if the current cert is valid >30 days. |
-| `--yes`, `-y` | no | Assume yes on non-fatal confirmations. |
-| `-h`, `--help` | no | Show usage. |
-| `-V`, `--version` | no | Print script version. |
+| `--domain <fqdn>` | да | Домен для сайта, TLS SNI и ACME-challenge. Должен уже резолвиться в этот VPS. |
+| `--email <addr>` | да | Контактный email для Let's Encrypt. Используйте свой домен. |
+| `--password <pw>` | один из | Пароль для Hysteria 2. **Виден в `ps` и shell history** — лучше используйте `--password-file`. |
+| `--password-file <path>` | один из | Читает пароль из первой строки файла. Сделайте `chmod 600` перед запуском. |
+| `--port <udp>` | нет | UDP-порт для Hysteria (по умолчанию `8443`). Диапазон 1–65535. |
+| `--webroot <path>` | нет | Корень сайта (по умолчанию `/var/www/<domain>`). |
+| `--site-title <text>` | нет | Подпись на статус-странице. **HTML-escape автоматически** — в тексте можно спокойно ставить кавычки и теги. |
+| `--cert-mode <copy\|acl>` | нет | Как Hysteria читает LE-серты. По умолчанию: `copy`. См. [Режимы доставки сертификатов](#режимы-доставки-сертификатов). |
+| `--force-renew` | нет | Заставить certbot перевыпустить серт, даже если текущий валиден >30 дней. |
+| `--yes`, `-y` | нет | Считать ответ «да» на некритичные подтверждения. |
+| `-h`, `--help` | нет | Показать usage. |
+| `-V`, `--version` | нет | Вывести версию скрипта. |
 
-If neither `--password` nor `--password-file` is supplied and the script is running interactively (`stdin` is a TTY), it will prompt for the password with echo disabled.
-
----
-
-## Secrets handling
-
-- **Never pass `--password` in a shared shell.** It will be visible in `ps auxf`, in your history file, and likely in any terminal screencast. Use `--password-file` or let the interactive prompt ask for it.
-- The password is **masked** in all log output (`ab***yz`).
-- `config.yaml` is written with `umask 077`, then `chown root:hysteria` and `chmod 640` — it is never world-readable, even for a fraction of a second.
-- The script **does not** cat the config to stdout. Previous versions did; the current version does not, so journald will not record the plaintext password during normal runs.
-- The password is **not** logged in plaintext anywhere, and it does not end up in the nginx status page or HTML.
+Если не передан ни `--password`, ни `--password-file`, а скрипт запущен интерактивно (`stdin` — TTY), он спросит пароль с выключенным echo.
 
 ---
 
-## Certificate delivery modes
+## Работа с секретами
 
-Hysteria runs as an unprivileged `hysteria` user and therefore cannot read `/etc/letsencrypt/archive/<domain>/privkey*.pem` with default permissions. There are two well-known ways to fix this, and this script supports both.
+- **Никогда не передавайте `--password` в общем shell.** Он будет виден в `ps auxf`, попадёт в history, скорее всего утечёт в записи терминала. Используйте `--password-file` или интерактивный ввод.
+- Пароль **маскируется** во всех логах (`ab***yz`).
+- `config.yaml` пишется под `umask 077`, затем `chown root:hysteria` и `chmod 640` — файл никогда не бывает world-readable даже на мгновение.
+- Скрипт **не** делает `cat` конфига в stdout. Старые версии это делали; текущая — нет, поэтому плейнтекст пароля не попадает в journald при обычных запусках.
+- Пароль **не** логируется в явном виде нигде и не оказывается на HTML-статус-странице.
 
-### `--cert-mode copy` (default)
+---
 
-What happens:
-- `fullchain.pem` and `privkey.pem` are copied into `/etc/hysteria/certs/`, owned by `hysteria:hysteria`, mode `640`.
-- A certbot **deploy-hook** is installed at `/etc/letsencrypt/renewal-hooks/deploy/hysteria-sync-<domain>.sh`. After every successful renewal for this lineage, the hook re-copies the certs and reloads `hysteria-server`.
-- The hook filters on `$RENEWED_LINEAGE` so it only runs for your domain — not for unrelated certificates you may issue later.
+## Режимы доставки сертификатов
 
-**Why it is the default:** it works on any filesystem, does not depend on ACL support, is trivial to reason about, and is easy to recover manually if something breaks.
+Hysteria работает от непривилегированного пользователя `hysteria` и поэтому не может читать `/etc/letsencrypt/archive/<domain>/privkey*.pem` с дефолтными правами. Есть два общепринятых способа это починить, и скрипт поддерживает оба.
 
-**Trade-off:** there are now two copies of the private key on disk (LE's `archive/` and `/etc/hysteria/certs/`), and if the deploy-hook ever fails silently, Hysteria will serve a stale certificate.
+### `--cert-mode copy` (по умолчанию)
+
+Что происходит:
+- `fullchain.pem` и `privkey.pem` копируются в `/etc/hysteria/certs/`, владелец `hysteria:hysteria`, режим `640`.
+- Ставится certbot **deploy-hook** в `/etc/letsencrypt/renewal-hooks/deploy/hysteria-sync-<domain>.sh`. После каждого успешного renewal для этого lineage hook пере-копирует серты и перезагружает `hysteria-server`.
+- Hook фильтрует по `$RENEWED_LINEAGE` и отрабатывает только для вашего домена — не для других сертификатов, которые вы можете выпустить позже.
+
+**Почему это дефолт:** работает на любой файловой системе, не зависит от поддержки ACL, тривиально дебажится и легко восстанавливается вручную, если что-то сломалось.
+
+**Trade-off:** приватный ключ теперь лежит в двух местах на диске (LE `archive/` и `/etc/hysteria/certs/`), и если deploy-hook когда-нибудь молча упадёт, Hysteria будет отдавать устаревший сертификат.
 
 ### `--cert-mode acl`
 
-What happens:
-- The script verifies the target filesystem actually supports POSIX ACLs (it writes a probe file and runs `setfacl` against it; if that fails, it **falls back to copy mode automatically**, with a warning).
-- Traverse bit (`x`, no `r`) for the `hysteria` user is set on every directory in the chain: `/etc/letsencrypt/live`, `/etc/letsencrypt/archive`, and the per-domain subdirectories. `x` without `r` means "enter, but cannot list" — Hysteria sees only the files it is explicitly granted.
-- Read bit (`r`) is granted on every existing versioned file inside `/etc/letsencrypt/archive/<domain>/` (`privkey*.pem`, `fullchain*.pem`, `chain*.pem`, `cert*.pem`).
-- A **default ACL** is set on `/etc/letsencrypt/archive/<domain>/`, so files created by future certbot renewals automatically inherit the ACL. Without this, certbot would write `privkey2.pem` with no ACL and Hysteria would silently start failing after ~60 days.
-- The script then **verifies as the `hysteria` user** (`sudo -u hysteria test -r ...`) that the `live/<domain>/fullchain.pem` and `privkey.pem` symlinks are actually readable. If verification fails for any reason, it falls back to copy mode.
-- A minimal deploy-hook is installed that only reloads `hysteria-server` (no file copying is needed in ACL mode).
+Что происходит:
+- Скрипт проверяет, что целевая ФС действительно поддерживает POSIX ACL (пишет probe-файл и пробует `setfacl` против него; если не получается — **автоматически переключается на copy mode** с WARN).
+- Для пользователя `hysteria` ставится traverse-бит (`x`, без `r`) на каждый каталог в цепочке: `/etc/letsencrypt/live`, `/etc/letsencrypt/archive` и на подкаталоги домена. `x` без `r` — это «войти можно, листинг нельзя». Hysteria видит только те файлы, путь к которым ему явно дан.
+- Read-бит (`r`) ставится на каждый существующий версионированный файл в `/etc/letsencrypt/archive/<domain>/` (`privkey*.pem`, `fullchain*.pem`, `chain*.pem`, `cert*.pem`).
+- Ставится **default ACL** на `/etc/letsencrypt/archive/<domain>/`, поэтому файлы, создаваемые будущими renewal'ами certbot, автоматически наследуют ACL. Без этого certbot создал бы `privkey2.pem` без ACL, и Hysteria через ~60 дней молча бы отвалился.
+- После этого скрипт **верифицирует от имени пользователя `hysteria`** (`sudo -u hysteria test -r ...`), что симлинки `live/<domain>/fullchain.pem` и `privkey.pem` действительно читаются. Если верификация не прошла — откат на copy mode.
+- Ставится минимальный deploy-hook, который только reload'ит `hysteria-server` (копирование файлов в ACL-режиме не нужно).
 
-**Why it is not the default:** it is stricter about the environment. If you are on an exotic filesystem, inside an unprivileged container, or on a SELinux-enforcing system, ACLs can silently stop applying after a package update or a `restorecon` run. Copy mode has none of those failure modes.
+**Почему это не дефолт:** режим строже к окружению. Если у вас экзотическая ФС, unprivileged-контейнер или SELinux enforcing — ACL может молча перестать применяться после обновления пакета или `restorecon`. У copy-режима таких failure-модов нет.
 
-**When to choose ACL:** if you want a single source of truth for the private key and you are on a standard ext4/xfs/btrfs Debian/Ubuntu VPS.
+**Когда выбирать ACL:** если вам нужен единственный источник правды для приватного ключа и вы на стандартной ext4/xfs/btrfs Debian/Ubuntu VPS.
 
-**Fallbacks.** ACL mode falls back to copy mode in any of these cases, all with a `[WARN]` log line:
-- `setfacl` binary missing after install.
-- Probe file cannot be created under `/etc/letsencrypt`.
-- Probe `setfacl` call fails (filesystem does not support ACLs).
-- Post-setup read verification fails as the `hysteria` user.
-
----
-
-## Idempotency and re-runs
-
-You can re-run this script on the same host — that is a supported workflow.
-
-- `certbot` is called with `--keep-until-expiring`, and the script short-circuits entirely if a valid cert with more than 30 days of life exists. Use `--force-renew` to override this.
-- `ufw` rules are queued idempotently; re-running does not duplicate them.
-- Nginx vhost files are overwritten intentionally — that is the whole point. The previous content is in the timestamped backup directory.
-- The Hysteria installer self-detects an existing install and skips its heavy lifting; this script additionally skips the install step entirely if the `hysteria` binary is already on `$PATH`.
-- The systemd drop-in is overwritten on every run.
-- ACL commands are additive and idempotent; repeated runs do not accumulate garbage.
-
-The one thing that is **not** idempotent across re-runs is the backup directory: a new one is created every run, with a timestamp suffix. This is intentional — each run produces an independent recoverable checkpoint.
+**Fallback'и.** ACL-режим откатывается на copy-режим в любом из этих случаев, все с `[WARN]`:
+- Нет бинаря `setfacl` после установки.
+- Не получается создать probe-файл под `/etc/letsencrypt`.
+- Вызов `setfacl` на probe не прошёл (ФС не поддерживает ACL).
+- Пост-верификация чтения от имени `hysteria` не прошла.
 
 ---
 
-## What gets hardened
+## Идемпотентность и повторные запуски
+
+Скрипт можно запускать повторно на том же хосте — это поддерживаемый сценарий.
+
+- `certbot` вызывается с `--keep-until-expiring`, а скрипт ещё раньше шорт-сёркьютит выпуск, если валидный серт живёт больше 30 дней. Чтобы форсировать перевыпуск — `--force-renew`.
+- Правила `ufw` добавляются идемпотентно — повторный запуск не дублирует их.
+- Nginx vhost-файлы намеренно перезаписываются — в этом и смысл. Предыдущее содержимое лежит в timestamped-бэкапе.
+- Upstream-установщик Hysteria сам определяет существующую инсталляцию и пропускает тяжёлую работу; плюс этот скрипт дополнительно пропускает шаг установки целиком, если бинарь `hysteria` уже в `$PATH`.
+- Systemd drop-in перезаписывается при каждом запуске.
+- ACL-команды аддитивны и идемпотентны; повторные запуски не накапливают мусор.
+
+Единственное, что **не** идемпотентно между запусками — каталог бэкапа: новый создаётся каждый раз с timestamp-суффиксом. Это сделано намеренно — каждый запуск оставляет независимую точку восстановления.
+
+---
+
+## Что захарденено
 
 ### Nginx TLS
 
-- `ssl_protocols TLSv1.2 TLSv1.3` — no SSLv3, no TLS 1.0/1.1.
-- AEAD-only cipher suite (AES-GCM + CHACHA20-POLY1305), `ssl_prefer_server_ciphers off` (client chooses, which is the modern recommendation).
-- `ssl_session_tickets off` — no session-ticket-key rotation burden, forward secrecy is preserved.
-- OCSP stapling (`ssl_stapling on`, `ssl_stapling_verify on`), with `resolver 1.1.1.1 8.8.8.8 valid=300s ipv6=off`.
-- `Strict-Transport-Security: max-age=63072000; includeSubDomains` (2 years).
+- `ssl_protocols TLSv1.2 TLSv1.3` — никакого SSLv3, TLS 1.0/1.1.
+- AEAD-only cipher suite (AES-GCM + CHACHA20-POLY1305), `ssl_prefer_server_ciphers off` (выбор за клиентом — современная рекомендация).
+- `ssl_session_tickets off` — никакой возни с ротацией ключей session ticket, forward secrecy сохранена.
+- OCSP stapling (`ssl_stapling on`, `ssl_stapling_verify on`), с `resolver 1.1.1.1 8.8.8.8 valid=300s ipv6=off`.
+- `Strict-Transport-Security: max-age=63072000; includeSubDomains` (2 года).
 - `X-Content-Type-Options: nosniff`.
 - `X-Frame-Options: DENY`.
 - `Referrer-Policy: no-referrer`.
 - `Permissions-Policy: interest-cohort=()`.
 
-### Script
+### Скрипт
 
 - `set -Eeuo pipefail`.
-- `trap ERR` that prints the failing line and the backup directory so you can roll back.
-- All user-facing inputs are validated (FQDN regex, email regex, numeric port range, cert-mode enum).
-- `--site-title` and `--domain` are HTML-escaped before being interpolated into the status page — no XSS.
-- `--password` is masked in logs, prompted with `read -s` when interactive, and written to a `mode 640 root:hysteria` file under `umask 077`.
-- The upstream Hysteria installer is fetched to a temp file and checked to start with `#!` before being executed.
-- UFW verifies the SSH rule is queued before enabling the firewall.
+- `trap ERR`, который печатает упавшую строку и путь к бэкапу, чтобы откатиться.
+- Весь пользовательский ввод валидируется (FQDN regex, email regex, диапазон порта, enum для cert-mode).
+- `--site-title` и `--domain` HTML-escape'ятся перед подстановкой в статус-страницу — никакого XSS.
+- `--password` маскируется в логах, спрашивается через `read -s` в интерактивном режиме и пишется в файл `mode 640 root:hysteria` под `umask 077`.
+- Upstream-установщик Hysteria скачивается в temp и проверяется на наличие `#!` перед запуском.
+- UFW проверяет, что SSH-правило поставлено в очередь, до включения firewall.
 
 ---
 
-## Backups and recovery
+## Бэкапы и восстановление
 
-Every run creates `/root/hysteria-vps-bootstrap-backup-<YYYYMMDD-HHMMSS>/` containing:
+Каждый запуск создаёт `/root/hysteria-vps-bootstrap-backup-<YYYYMMDD-HHMMSS>/` со следующим содержимым:
 
-- `nginx/` — full copy of `/etc/nginx` as it was before the run.
-- `hysteria/` — full copy of `/etc/hysteria` (if it existed).
-- `letsencrypt-meta/` — `renewal/` and `renewal-hooks/` from `/etc/letsencrypt`. Private keys themselves are **not** copied (they are never duplicated needlessly).
+- `nginx/` — полная копия `/etc/nginx` на момент до запуска.
+- `hysteria/` — полная копия `/etc/hysteria` (если существовал).
+- `letsencrypt-meta/` — `renewal/` и `renewal-hooks/` из `/etc/letsencrypt`. Приватные ключи сами по себе **не** копируются (они нигде не дублируются зря).
 
-To roll back the nginx changes:
+Откатить изменения nginx:
 
 ```bash
 sudo cp -a /root/hysteria-vps-bootstrap-backup-<ts>/nginx/. /etc/nginx/
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
-To roll back the hysteria config:
+Откатить конфиг hysteria:
 
 ```bash
 sudo cp -a /root/hysteria-vps-bootstrap-backup-<ts>/hysteria/. /etc/hysteria/
@@ -225,9 +225,9 @@ sudo systemctl restart hysteria-server
 
 ---
 
-## Verification
+## Проверка
 
-The script's own `verify_services` step checks all of these automatically. If you want to run them by hand:
+Шаг `verify_services` скрипта гоняет все эти проверки автоматически. Если нужно руками:
 
 ```bash
 # hysteria-server
@@ -239,93 +239,93 @@ ss -ulnp | grep :8443
 systemctl status nginx --no-pager -l
 curl -I https://your-domain.com
 
-# TLS handshake details (from outside)
+# Детали TLS-хендшейка (снаружи)
 openssl s_client -connect your-domain.com:443 -servername your-domain.com -tls1_3 </dev/null 2>/dev/null | openssl x509 -noout -dates -issuer -subject
 
-# cert reachable by hysteria user (useful for debugging ACL mode)
+# Серт реально читается пользователем hysteria (особенно полезно для ACL-режима)
 sudo -u hysteria test -r /etc/letsencrypt/live/your-domain.com/privkey.pem && echo OK || echo FAIL
 ```
 
 ---
 
-## Client configuration
+## Настройка клиента
 
-Tested with Surge; the same parameters apply to any Hysteria 2 client.
+Протестировано с Surge; те же параметры подходят любому Hysteria 2 клиенту.
 
 - **Protocol:** Hysteria 2
-- **Server Address:** VPS IP (often more reliable than the domain, especially on networks that mangle DNS)
-- **Port:** whatever you passed to `--port`
-- **Password:** the one from your `--password-file`
-- **Custom TLS SNI:** your domain
-- **IP Version:** IPv4 Only, unless you know you need v6
+- **Server Address:** IP VPS (часто надёжнее, чем домен, особенно в сетях, которые ломают DNS)
+- **Port:** то, что передали в `--port`
+- **Password:** тот же, что из `--password-file`
+- **Custom TLS SNI:** ваш домен
+- **IP Version:** IPv4 Only, если нет явной причины использовать v6
 
 ---
 
-## Troubleshooting
+## Диагностика проблем
 
-**Certbot failed with "Invalid response from …".** Your DNS A record does not point to this VPS, or port 80 is blocked at the cloud firewall level. The DNS preflight should have caught this — if you bypassed it or it passed but the Let's Encrypt validator still fails, check the cloud firewall.
+**Certbot упал с «Invalid response from …».** A-запись домена не указывает на этот VPS, либо порт 80 закрыт на уровне облачного firewall. DNS-preflight должен был это поймать — если вы его обошли или он прошёл, но валидатор Let's Encrypt всё равно падает, проверяйте облачный firewall.
 
-**`hysteria-server` is active but nothing connects.** Check `ss -ulnp | grep :<port>`. If it is missing, the service is running but not binding — usually a TLS file permission problem. Re-run with `--cert-mode copy` to sidestep ACL-related issues, or run `sudo -u hysteria test -r /etc/letsencrypt/live/<domain>/privkey.pem` to see the actual permission error.
+**`hysteria-server` активен, но подключения не идут.** Проверьте `ss -ulnp | grep :<port>`. Если пусто — сервис запущен, но не биндится, обычно это проблема прав на TLS-файлы. Перезапустите с `--cert-mode copy`, чтобы обойти ACL-проблемы, или запустите `sudo -u hysteria test -r /etc/letsencrypt/live/<domain>/privkey.pem`, чтобы увидеть реальную ошибку доступа.
 
-**HTTPS works in the browser but `curl -I https://<domain>` returns a connection error on the VPS itself.** Almost always IPv6: the VPS has an AAAA record pointing somewhere else, and nginx is binding only v4. Either add `listen [::]:443 ssl;` (already in the hardened vhost) and fix DNS, or disable v6 on the host.
+**HTTPS работает в браузере, но `curl -I https://<domain>` с самого VPS возвращает ошибку соединения.** Почти всегда IPv6: у VPS есть AAAA-запись, указывающая куда-то не туда, а nginx биндится только на v4. Либо добавьте `listen [::]:443 ssl;` (уже есть в хардененном vhost) и почините DNS, либо отключите v6 на хосте.
 
-**ACL mode silently stopped working after ~60 days.** Certbot renewed and created `privkey2.pem` in `archive/` without inheriting the ACL. This should not happen because the script sets a default ACL on the archive directory — but if it does, check `getfacl /etc/letsencrypt/archive/<domain>/` and verify the `default:user:hysteria:r--` entry is still present. If it was dropped (package upgrade, manual `setfacl --remove-all`), re-run the bootstrap or re-apply the ACLs manually.
+**ACL-режим молча перестал работать примерно через 60 дней.** Certbot сделал renewal и создал `privkey2.pem` в `archive/` без наследования ACL. Такого быть не должно, потому что скрипт ставит default ACL на каталог archive — но если случилось, проверьте `getfacl /etc/letsencrypt/archive/<domain>/` и убедитесь, что запись `default:user:hysteria:r--` на месте. Если её снесли (обновление пакета, ручной `setfacl --remove-all`) — перезапустите bootstrap или переприменить ACL руками.
 
-**"Let's Encrypt rate limit exceeded".** You ran the script too many times without `--force-renew` protection, on older versions of this script. The current version is idempotent and will not re-issue a valid certificate. Wait out the rate limit, then re-run — it will skip issuance and only fix the downstream state.
+**«Let's Encrypt rate limit exceeded».** Вы много раз запускали скрипт без защиты `--force-renew` — это про старые версии. Текущая версия идемпотентна и не будет перевыпускать валидный сертификат. Дождитесь окончания rate-limit и перезапустите — выпуск будет пропущен, и скрипт только починит downstream-состояние.
 
-**`ufw` blocked my SSH.** The script queues the SSH rule and refuses to enable the firewall if the rule is missing, so this should not happen. If it does anyway (for example, a pre-existing deny rule matched first), fall back to your cloud provider's console to re-enable SSH.
-
----
-
-## Security notes
-
-- This script is designed for **you owning the VPS**. It is not a security appliance for hostile tenants. In particular, anyone with `root` on the box can read `/etc/hysteria/config.yaml`.
-- The Hysteria password is effectively the only auth factor. Pick one from a password manager, ship it via `--password-file`, and rotate it if it leaks.
-- Let's Encrypt private keys live in `/etc/letsencrypt/archive/<domain>/`. In `copy` mode, a second copy lives in `/etc/hysteria/certs/`. In `acl` mode, only the original copy exists.
-- No fail2ban, no rate limiting on Nginx, no IDS. Add those separately if your threat model needs them — they are intentionally out of scope for a bootstrap script.
-- SELinux is not handled. If you are on a distro that ships SELinux enforcing, you are on your own — submit an issue.
+**`ufw` заблокировал SSH.** Скрипт ставит SSH-правило в очередь и отказывается включать firewall, если правила нет, так что этого быть не должно. Если всё же произошло (например, сработало заранее существующее deny-правило) — восстанавливайте SSH через консоль облачного провайдера.
 
 ---
 
-## Uninstall
+## Заметки по безопасности
 
-There is no one-shot uninstaller (scope decision). To undo what the script did:
+- Скрипт рассчитан на сценарий «VPS принадлежит вам». Это **не** security appliance для мультитенантного окружения. В частности, любой, у кого есть `root` на хосте, может прочитать `/etc/hysteria/config.yaml`.
+- Пароль Hysteria — фактически единственный фактор аутентификации. Берите его из менеджера паролей, доставляйте через `--password-file` и ротируйте, если утёк.
+- Приватные ключи Let's Encrypt лежат в `/etc/letsencrypt/archive/<domain>/`. В режиме `copy` вторая копия живёт в `/etc/hysteria/certs/`. В режиме `acl` существует только оригинал.
+- Никакого fail2ban, rate-limit на Nginx, IDS. Если ваша модель угроз этого требует — добавляйте отдельно, это намеренно вне scope bootstrap-скрипта.
+- SELinux не поддерживается. Если вы на дистрибутиве с SELinux enforcing — вы сами по себе, заводите issue.
+
+---
+
+## Удаление
+
+Отдельного one-shot uninstaller'а нет (осознанное решение). Чтобы откатить то, что сделал скрипт:
 
 ```bash
-# Stop and disable hysteria
+# Остановить и отключить hysteria
 sudo systemctl disable --now hysteria-server
 sudo rm -f /etc/systemd/system/hysteria-server.service.d/override.conf
 sudo systemctl daemon-reload
 
-# Remove hysteria binary (installer-provided)
-sudo bash -c 'command -v hysteria && hysteria --help >/dev/null'  # check what is installed
+# Удалить бинарь hysteria (его ставит upstream-установщик)
+sudo bash -c 'command -v hysteria && hysteria --help >/dev/null'  # посмотреть, что установлено
 sudo rm -f /usr/local/bin/hysteria
 sudo rm -rf /etc/hysteria
 sudo userdel hysteria 2>/dev/null || true
 
-# Remove nginx vhost
+# Удалить nginx vhost
 sudo rm -f /etc/nginx/sites-enabled/<domain> /etc/nginx/sites-available/<domain>
 sudo systemctl reload nginx
 
-# Remove certbot deploy-hook
+# Удалить certbot deploy-hook
 sudo rm -f /etc/letsencrypt/renewal-hooks/deploy/hysteria-*-<domain>.sh
 
-# Optional: revoke the certificate
+# Опционально: отозвать сертификат
 sudo certbot revoke --cert-name <domain>
 sudo certbot delete --cert-name <domain>
 
-# Optional: close the UDP port
+# Опционально: закрыть UDP-порт
 sudo ufw delete allow <port>/udp
 ```
 
-Leave `nginx`, `certbot`, and `ufw` installed unless you are sure you do not need them.
+`nginx`, `certbot` и `ufw` не удаляйте, если не уверены, что они вам не нужны.
 
 ---
 
-## License
+## Лицензия
 
-See [LICENSE](LICENSE). Use at your own risk; verify the configuration against your own security policy before running in production.
+См. [LICENSE](LICENSE). Использование — на ваш риск; перед прод-запуском сверьте конфигурацию со своей политикой безопасности.
 
 ## GitHub About
 
-Copy-paste descriptions for the repository About field live in [GITHUB_REPO_META.md](GITHUB_REPO_META.md).
+Готовые формулировки для поля About репозитория лежат в [GITHUB_REPO_META.md](GITHUB_REPO_META.md).
