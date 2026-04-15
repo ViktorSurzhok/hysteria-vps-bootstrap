@@ -69,12 +69,16 @@
 Самый простой способ — одной командой прямо с GitHub. Скрипт спросит пароль интерактивно (ввод без эха, в `ps` и history не попадёт):
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/ViktorSurzhok/hysteria-vps-bootstrap/main/setup-hysteria.sh) \
-  --domain static.example.com \
-  --email admin@example.com \
-  --port 443
+curl -fsSL https://raw.githubusercontent.com/ViktorSurzhok/hysteria-vps-bootstrap/main/setup-hysteria.sh \
+  | sudo bash -s -- \
+      --domain static.example.com \
+      --email admin@example.com \
+      --port 443
 # Hysteria password: ********
 ```
+
+> **Почему именно `curl … | sudo bash -s -- …`, а не `sudo bash <(curl …)`?**
+> Process substitution `<(…)` создаёт файловый дескриптор в namespace вашего пользователя, а `sudo` запускает bash в namespace root, где этот FD уже не виден. На современных Ubuntu это ломается с ошибкой `/dev/fd/63: No such file or directory`. Пайп через `sudo bash -s --` работает везде, а скрипт читает пароль напрямую из `/dev/tty`, поэтому интерактивный запрос пароля не мешает тому, что stdin занят телом скрипта.
 
 Это всё. Ни клонировать репозиторий, ни качать файлы отдельно не нужно — одна команда разворачивает всё и в конце печатает параметры подключения для клиента.
 

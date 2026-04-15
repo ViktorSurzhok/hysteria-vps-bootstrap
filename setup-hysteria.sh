@@ -152,11 +152,15 @@ validate_inputs() {
   fi
 
   if [[ -z "$PASSWORD" ]]; then
-    if [[ -t 0 ]]; then
-      read -r -s -p "Hysteria password: " PASSWORD; echo
+    # Read from /dev/tty directly so the prompt works even when stdin is
+    # busy (e.g. `curl … | sudo bash -s -- …`) or not a TTY.
+    if [[ -r /dev/tty && -w /dev/tty ]]; then
+      printf 'Hysteria password: ' >/dev/tty
+      IFS= read -r -s PASSWORD </dev/tty
+      printf '\n' >/dev/tty
       [[ -n "$PASSWORD" ]] || die "empty password"
     else
-      die "--password or --password-file is required (or run interactively)"
+      die "--password or --password-file is required (no TTY available for interactive prompt)"
     fi
   fi
 
