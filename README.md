@@ -66,29 +66,43 @@
 
 ## Быстрый старт
 
-```bash
-# Рекомендуемый способ: пароль из файла, а не из командной строки
-echo 'StrongPasswordHere' > /root/.hysteria.pw
-chmod 600 /root/.hysteria.pw
+Самый простой вариант — не передавать пароль в аргументах вообще. Скрипт спросит его интерактивно (ввод без эха, в `ps` и history не попадёт):
 
+```bash
 sudo bash setup-hysteria.sh \
   --domain static.example.com \
   --email admin@example.com \
-  --password-file /root/.hysteria.pw \
   --port 8443 \
-  --cert-mode copy \
   --site-title "Инфраструктурный узел активен."
+# Hysteria password: ********
 ```
 
-One-liner с GitHub (файл с паролем всё равно готовьте отдельно — мы сознательно не принимаем секреты через stdin от `curl`, чтобы они не попали в shell history):
+One-liner с GitHub — так же, без пароля в аргументах:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ViktorSurzhok/hysteria-vps-bootstrap/main/setup-hysteria.sh) \
   --domain static.example.com \
   --email admin@example.com \
+  --port 8443
+# Hysteria password: ********
+```
+
+Если вы автоматизируете установку (Ansible, CI, Terraform `remote-exec`) и интерактивный ввод невозможен — используйте `--password-file`:
+
+```bash
+install -m 600 /dev/null /root/.hysteria.pw
+echo -n 'StrongPasswordHere' | sudo tee /root/.hysteria.pw >/dev/null
+
+sudo bash setup-hysteria.sh \
+  --domain static.example.com \
+  --email admin@example.com \
   --password-file /root/.hysteria.pw \
   --port 8443
+
+sudo shred -u /root/.hysteria.pw   # если не нужны повторные запуски
 ```
+
+Флаг `--password <pw>` тоже существует, но **не рекомендуется**: пароль будет виден в `ps auxf` и попадёт в `~/.bash_history`.
 
 ---
 
