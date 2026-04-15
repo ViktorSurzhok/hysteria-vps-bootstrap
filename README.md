@@ -66,24 +66,29 @@
 
 ## Быстрый старт
 
-Самый простой вариант — не передавать пароль в аргументах вообще. Скрипт спросит его интерактивно (ввод без эха, в `ps` и history не попадёт):
+Самый простой способ — одной командой прямо с GitHub. Скрипт спросит пароль интерактивно (ввод без эха, в `ps` и history не попадёт):
 
 ```bash
-sudo bash setup-hysteria.sh \
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/ViktorSurzhok/hysteria-vps-bootstrap/main/setup-hysteria.sh) \
   --domain static.example.com \
   --email admin@example.com \
-  --port 8443 \
-  --site-title "Инфраструктурный узел активен."
+  --port 443
 # Hysteria password: ********
 ```
 
-One-liner с GitHub — так же, без пароля в аргументах:
+Это всё. Ни клонировать репозиторий, ни качать файлы отдельно не нужно — одна команда разворачивает всё и в конце печатает параметры подключения для клиента.
+
+Если вы предпочитаете сначала скачать скрипт локально и посмотреть, что он делает (это правильная привычка для любого `curl | bash`), — склонируйте репозиторий и запускайте локальный файл:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/ViktorSurzhok/hysteria-vps-bootstrap/main/setup-hysteria.sh) \
+git clone https://github.com/ViktorSurzhok/hysteria-vps-bootstrap.git
+cd hysteria-vps-bootstrap
+
+sudo bash setup-hysteria.sh \
   --domain static.example.com \
   --email admin@example.com \
-  --port 8443
+  --port 443 \
+  --site-title "Инфраструктурный узел активен."
 # Hysteria password: ********
 ```
 
@@ -97,7 +102,7 @@ sudo bash setup-hysteria.sh \
   --domain static.example.com \
   --email admin@example.com \
   --password-file /root/.hysteria.pw \
-  --port 8443
+  --port 443
 
 sudo shred -u /root/.hysteria.pw   # если не нужны повторные запуски
 ```
