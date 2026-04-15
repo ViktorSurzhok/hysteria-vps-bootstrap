@@ -66,7 +66,7 @@
 
 ## Быстрый старт
 
-Самый простой способ — одной командой прямо с GitHub. Скрипт спросит пароль интерактивно (ввод без эха, в `ps` и history не попадёт):
+Самый простой способ — одной командой прямо с GitHub. Скрипт спросит пароль, его нужно ввести:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ViktorSurzhok/hysteria-vps-bootstrap/main/setup-hysteria.sh \
@@ -74,7 +74,7 @@ curl -fsSL https://raw.githubusercontent.com/ViktorSurzhok/hysteria-vps-bootstra
       --domain static.example.com \
       --email admin@example.com \
       --port 443
-# Hysteria password: ********
+
 ```
 
 > **Почему именно `curl … | sudo bash -s -- …`, а не `sudo bash <(curl …)`?**
