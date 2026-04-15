@@ -74,7 +74,6 @@ curl -fsSL https://raw.githubusercontent.com/ViktorSurzhok/hysteria-vps-bootstra
       --domain static.example.com \
       --email admin@example.com \
       --port 443
-
 ```
 
 > **Почему именно `curl … | sudo bash -s -- …`, а не `sudo bash <(curl …)`?**
@@ -92,9 +91,7 @@ sudo bash setup-hysteria.sh \
   --domain static.example.com \
   --email admin@example.com \
   --port 443 \
-  --site-title "Инфраструктурный узел активен."
-# Hysteria password: ********
-```
+  --site-title "Инфраструктурный узел активен."```
 
 Если вы автоматизируете установку (Ansible, CI, Terraform `remote-exec`) и интерактивный ввод невозможен — используйте `--password-file`:
 
