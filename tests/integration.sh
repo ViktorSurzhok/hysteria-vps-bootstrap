@@ -7,6 +7,14 @@ set -Eeuo pipefail
 (( EUID == 0 )) || { echo 'Run with sudo -E'; exit 1; }
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 domain=bootstrap.example.test
+# A sysctl alone leaves AF_INET6 sockets available on some kernels. Restrict the
+# address family with systemd/seccomp to reproduce socket() EAFNOSUPPORT exactly.
+if [[ "${TEST_IPV6:-0}" == 0 && "${BOOTSTRAP_RESTRICTED:-0}" != 1 ]]; then
+  exec systemd-run --wait --pipe --collect --property='RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK' \
+    --setenv=GITHUB_ACTIONS=true --setenv=RUNNER_ENVIRONMENT=github-hosted \
+    --setenv=TEST_IPV6=0 --setenv=BOOTSTRAP_RESTRICTED=1 bash "$repo/tests/integration.sh"
+fi
+export TERM=xterm
 trap 'journalctl -u nginx -u hysteria-server -n 60 --no-pager || true' ERR
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -36,12 +44,16 @@ export PATH="/tmp/bootstrap-fixtures:$PATH"
 # Induce the reported package failure on IPv4-only runners, before bootstrap.
 if [[ "${TEST_IPV6:-0}" == 0 ]]; then
   sysctl -w net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1
+  mkdir -p /etc/systemd/system/nginx.service.d
+  printf '[Service]\nRestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK\n' > /etc/systemd/system/nginx.service.d/test-ipv4.conf
+  systemctl daemon-reload
 else
   sysctl -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.default.disable_ipv6=0
 fi
 apt-get install -y nginx || true
 if [[ "${TEST_IPV6:-0}" == 0 ]]; then
   systemctl stop nginx || true
+  ln -sfn /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
   printf '\nserver {\n listen [::]:18080;\n}\n' >> /etc/nginx/sites-available/default
   if nginx -t; then echo 'Expected IPv6 failure not reproduced' >&2; exit 1; fi
   # Exercise dpkg --configure -a with nginx explicitly awaiting configuration.
@@ -66,6 +78,8 @@ fi
 [[ "$(stat -c %a /etc/hysteria/config.yaml)" == 640 ]]
 cp /etc/hysteria/config.yaml /tmp/first-config
 # Same command with no password must reuse it, issue no cert, preserve HTTPS.
+# Exercise a pipe deliberately (the documented curl | bash entry point).
+# shellcheck disable=SC2002
 cat "$repo/setup-hysteria.sh" | bash -s -- "${args[@]}" > /tmp/repeat.log 2>&1 || { cat /tmp/repeat.log; exit 1; }
 cmp /etc/hysteria/config.yaml /tmp/first-config
 [[ "$(wc -l < /tmp/certbot-calls)" == 1 ]]
@@ -115,6 +129,11 @@ cmp /etc/letsencrypt/renewal-hooks/deploy/hysteria-bootstrap.sh /tmp/before-hook
 systemctl is-active --quiet hysteria-server
 ss -H -lunp 'sport = :443' | grep hysteria
 # Exercise explicit UFW activation with a nonstandard SSH port on a disposable VM.
+mkdir -p /run/sshd
+ssh-keygen -A
+printf 'Port 2222\n' > /etc/ssh/sshd_config.d/bootstrap-test.conf
+sshd -T >/tmp/sshd-effective
+systemctl restart ssh
 SSH_CONNECTION='192.0.2.1 50000 203.0.113.10 2222' bash "$repo/setup-hysteria.sh" "${args[@]}" --ufw enable >/tmp/ufw.log 2>&1 || { cat /tmp/ufw.log; exit 1; }
 ufw status | grep '2222/tcp'
 ufw status | grep '443/udp'

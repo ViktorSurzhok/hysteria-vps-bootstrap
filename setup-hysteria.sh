@@ -44,7 +44,7 @@ parse_args() {
   while (( $# )); do
     case "$1" in
       --domain|--email|--password|--password-file|--port|--webroot|--site-title|--cert-mode|--ufw|--ssh-port)
-        (( $# >= 2 )) && [[ -n "$2" && "$2" != --* ]] || die "missing value for $1"
+        if (( $# < 2 )) || [[ -z "$2" || "$2" == --* ]]; then die "missing value for $1"; fi
         case "$1" in
           --domain) DOMAIN="$2" ;; --email) EMAIL="$2" ;;
           --password) PASSWORD="$2" ;; --password-file) PASSWORD_FILE="$2" ;;
@@ -303,7 +303,7 @@ configure_firewall() {
     discover_ssh_ports
     # Insert before existing deny rules. Never reset rules or default policies.
     for port in "${SSH_PORTS[@]}"; do
-      ufw insert 1 allow "$((10#$port))/tcp" comment 'hysteria-bootstrap SSH'
+      ufw prepend allow "$((10#$port))/tcp" comment 'hysteria-bootstrap SSH'
     done
   fi
   ufw allow 80/tcp comment 'hysteria-bootstrap HTTP'
@@ -462,7 +462,7 @@ write_nginx_site() {
   fi
   if (( had_old )); then cp -a "$old" "$target"; else rm -f "$target"; fi
   if (( ! had_link )); then rm -f "$link"; fi
-  nginx -t && systemctl reload-or-restart nginx || true
+  if nginx -t; then systemctl reload-or-restart nginx || true; fi
   die "nginx activation failed; previous site restored"
 }
 
