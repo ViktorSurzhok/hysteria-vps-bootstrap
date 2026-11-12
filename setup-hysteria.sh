@@ -176,6 +176,7 @@ repair_nginx_ipv6() {
 install_base_packages() {
   log "repairing package state and installing dependencies"
   export DEBIAN_FRONTEND=noninteractive
+  local apt_options=(-o DPkg::Lock::Timeout=120 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
   # Prevent nginx's postinst from starting its new IPv6 default before it is repaired.
   # Other service requests are delegated to any original local policy.
   local policy=/usr/sbin/policy-rc.d saved=/usr/sbin/policy-rc.d.hysteria-backup policy_tmp
@@ -194,19 +195,34 @@ POLICY
   if [[ -e "$policy" || -L "$policy" ]]; then mv "$policy" "$saved"; fi
   mv -f "$policy_tmp" "$policy"
   repair_nginx_ipv6
-  if ! dpkg --configure -a; then
-    apt-get -o DPkg::Lock::Timeout=120 -f install -y
-    dpkg --configure -a
+  if ! dpkg --force-confdef --force-confold --configure -a; then
+    apt-get "${apt_options[@]}" -f install -y
+    dpkg --force-confdef --force-confold --configure -a
   fi
-  apt-get -o DPkg::Lock::Timeout=120 update
+  apt-get "${apt_options[@]}" update
   local pkgs=(ca-certificates curl nginx certbot dnsutils ufw openssl python3 python3-yaml iproute2 util-linux)
   [[ "$CERT_MODE" != acl ]] || pkgs+=(acl)
-  apt-get -o DPkg::Lock::Timeout=120 install -y "${pkgs[@]}"
+  apt-get "${apt_options[@]}" install -y "${pkgs[@]}"
   detect_ipv6
   repair_nginx_ipv6
   restore_package_policy
   nginx -t || die "nginx configuration is invalid; check unrelated sites (backup: $BACKUP_DIR)"
   log "IPv6 listeners available: $IPV6_AVAILABLE"
+}
+
+read_existing_password() {
+  python3 - "$1" <<'PY_PASSWORD'
+import sys, yaml
+try:
+    with open(sys.argv[1]) as f:
+        c = yaml.safe_load(f)
+    a = c.get('auth', {})
+    if a.get('type') != 'password' or not isinstance(a.get('password'), str):
+        raise ValueError()
+except (OSError, yaml.YAMLError, AttributeError, ValueError):
+    raise SystemExit('Cannot safely reuse existing password; provide --password-file explicitly.')
+print(a['password'], end='')
+PY_PASSWORD
 }
 
 load_password() {
@@ -215,16 +231,7 @@ load_password() {
     IFS= read -r PASSWORD < "$PASSWORD_FILE" || [[ -n "$PASSWORD" ]]
     PASSWORD="${PASSWORD%$'\r'}"
   elif [[ -z "$PASSWORD" && -f /etc/hysteria/config.yaml ]]; then
-    PASSWORD="$(python3 - <<'PY_PASSWORD'
-import yaml
-with open('/etc/hysteria/config.yaml') as f:
-    c = yaml.safe_load(f)
-a = c.get('auth', {})
-if a.get('type') != 'password' or not isinstance(a.get('password'), str):
-    raise SystemExit('Existing config has no string password; provide --password-file explicitly.')
-print(a['password'], end='')
-PY_PASSWORD
-)"
+    PASSWORD="$(read_existing_password /etc/hysteria/config.yaml)"
     log "reusing existing Hysteria password"
   elif [[ -z "$PASSWORD" ]]; then
     if { exec 3<>/dev/tty; } 2>/dev/null; then

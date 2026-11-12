@@ -105,6 +105,15 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('hysteria-vps-bootstrap 1.1.0', r.stdout)
 
+    def test_malformed_existing_yaml_never_echoes_password(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'config.yaml'
+            p.write_text('auth: [SUPER_SECRET: broken: yaml]')
+            r = run_bash('read_existing_password "$FIXTURE"', FIXTURE=str(p))
+            self.assertNotEqual(r.returncode, 0)
+            self.assertNotIn('SUPER_SECRET', r.stdout + r.stderr)
+            self.assertIn('provide --password-file', r.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()
