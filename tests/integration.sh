@@ -50,18 +50,16 @@ if [[ "${TEST_IPV6:-0}" == 0 ]]; then
 else
   sysctl -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.default.disable_ipv6=0
 fi
-apt-get install -y nginx || true
 if [[ "${TEST_IPV6:-0}" == 0 ]]; then
-  systemctl stop nginx || true
-  ln -sfn /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
-  printf '\nserver {\n listen [::]:18080;\n}\n' >> /etc/nginx/sites-available/default
+  # Runner images contain nginx already. Purge it so postinst takes the initial
+  # install path (reconfiguring an inactive, previously installed service skips start).
+  apt-get purge -y nginx nginx-common
+  systemctl daemon-reload
+  if apt-get install -y nginx; then echo 'Expected initial nginx package failure' >&2; exit 1; fi
   if nginx -t; then echo 'Expected IPv6 failure not reproduced' >&2; exit 1; fi
-  # Exercise dpkg --configure -a with nginx explicitly awaiting configuration.
-  dpkg --unpack /var/cache/apt/archives/nginx_*.deb 2>/dev/null || {
-    (cd /tmp && apt-get download nginx)
-    dpkg --unpack /tmp/nginx_*.deb
-  }
-  if dpkg --configure nginx; then echo 'Expected interrupted nginx configuration' >&2; exit 1; fi
+  dpkg --audit | grep nginx
+else
+  apt-get install -y nginx
 fi
 printf '%s\n' 'true: # "quotes" & unicode-кириллица' > /tmp/bootstrap.password
 chmod 600 /tmp/bootstrap.password
@@ -134,8 +132,15 @@ ssh-keygen -A
 printf 'Port 2222\n' > /etc/ssh/sshd_config.d/bootstrap-test.conf
 sshd -T >/tmp/sshd-effective
 systemctl restart ssh
+# An existing duplicate allow below a deny must be moved before activation.
+ufw allow 2222/tcp
+ufw prepend deny proto tcp from 192.0.2.1 to any port 2222
+ufw allow 54321/udp comment 'unrelated preserved rule'
 SSH_CONNECTION='192.0.2.1 50000 203.0.113.10 2222' bash "$repo/setup-hysteria.sh" "${args[@]}" --ufw enable >/tmp/ufw.log 2>&1 || { cat /tmp/ufw.log; exit 1; }
 ufw status | grep '2222/tcp'
 ufw status | grep '443/udp'
+ufw status | grep '54321/udp'
+first_ssh_rule="$(iptables -S ufw-user-input | awk '/--dport 2222 / {print; exit}')"
+[[ "$first_ssh_rule" == *'-j ACCEPT'* ]]
 ufw disable
 printf '\nIntegration passed: install, dpkg recovery, rerun, client handshake, renewal, ACL/copy, rollback, UFW.\n'

@@ -160,9 +160,11 @@ repair_ipv6_file() {
   local file=$1 tmp
   [[ -f "$file" ]] || return 0
   # Only standalone wildcard IPv6 listeners. Never delete an inline server block.
-  tmp="$(mktemp)"
+  if [[ -L "$file" ]]; then file="$(readlink -f "$file")"; fi
+  tmp="$(mktemp "${file}.hysteria.XXXXXX")"
+  cp -p "$file" "$tmp"
   sed -E '/^[[:space:]]*listen[[:space:]]+\[::\]:[0-9]+[^;]*;[[:space:]]*(#.*)?$/d' "$file" > "$tmp"
-  if ! cmp -s "$file" "$tmp"; then cat "$tmp" > "$file"; fi
+  if ! cmp -s "$file" "$tmp"; then mv -f "$tmp" "$file"; fi
   rm -f "$tmp"
 }
 repair_nginx_ipv6() {
@@ -176,10 +178,10 @@ install_base_packages() {
   export DEBIAN_FRONTEND=noninteractive
   # Prevent nginx's postinst from starting its new IPv6 default before it is repaired.
   # Other service requests are delegated to any original local policy.
-  local policy=/usr/sbin/policy-rc.d saved=/usr/sbin/policy-rc.d.hysteria-backup
+  local policy=/usr/sbin/policy-rc.d saved=/usr/sbin/policy-rc.d.hysteria-backup policy_tmp
   [[ ! -e "$saved" && ! -L "$saved" ]] || die "unresolved package policy backup: $saved"
-  if [[ -e "$policy" || -L "$policy" ]]; then mv "$policy" "$saved"; fi
-  cat > "$policy" <<'POLICY'
+  policy_tmp="$(mktemp /usr/sbin/.hysteria-policy.XXXXXX)"
+  cat > "$policy_tmp" <<'POLICY'
 #!/bin/sh
 # hysteria-bootstrap temporary policy
 case "${1:-}" in nginx|nginx.service) exit 101 ;; esac
@@ -188,7 +190,9 @@ if [ -x /usr/sbin/policy-rc.d.hysteria-backup ]; then
 fi
 exit 0
 POLICY
-  chmod 755 "$policy"
+  chmod 755 "$policy_tmp"
+  if [[ -e "$policy" || -L "$policy" ]]; then mv "$policy" "$saved"; fi
+  mv -f "$policy_tmp" "$policy"
   repair_nginx_ipv6
   if ! dpkg --configure -a; then
     apt-get -o DPkg::Lock::Timeout=120 -f install -y
@@ -299,10 +303,13 @@ configure_firewall() {
     log "UFW is inactive; leaving it inactive (use --ufw enable to opt in)"
     return
   fi
-  if [[ "$UFW_MODE" == enable ]]; then
+  if [[ "$UFW_MODE" == enable && "$status" != *'Status: active'* ]]; then
     discover_ssh_ports
-    # Insert before existing deny rules. Never reset rules or default policies.
+    # UFW skips duplicate allows even when they are below a deny. Only while
+    # inactive, remove the exact generic rule and prepend it before activation.
+    # Never remove a live SSH rule or reset rules/default policies.
     for port in "${SSH_PORTS[@]}"; do
+      ufw --force delete allow "$((10#$port))/tcp"
       ufw prepend allow "$((10#$port))/tcp" comment 'hysteria-bootstrap SSH'
     done
   fi
@@ -511,6 +518,8 @@ rollback_hysteria() {
   systemctl stop hysteria-server || true
   cp -a "$snapshot/hysteria/." /etc/hysteria/
   if [[ ! -f "$snapshot/hysteria/config.yaml" ]]; then rm -f /etc/hysteria/config.yaml; fi
+  if [[ ! -f "$snapshot/hysteria/bootstrap-domain" ]]; then rm -f /etc/hysteria/bootstrap-domain; fi
+  rm -f /etc/hysteria/.bootstrap-domain
   for hook in hysteria-bootstrap.sh "hysteria-sync-$DOMAIN.sh" "hysteria-reload-$DOMAIN.sh"; do
     rm -f "/etc/letsencrypt/renewal-hooks/deploy/$hook"
     if [[ -f "$snapshot/hooks/$hook" ]]; then cp -a "$snapshot/hooks/$hook" /etc/letsencrypt/renewal-hooks/deploy/; fi
@@ -764,7 +773,9 @@ main() {
   ensure_hysteria_restart_policy
   write_hysteria_config
   verify_services
-  printf '%s\n' "$DOMAIN" > /etc/hysteria/bootstrap-domain
+  printf '%s\n' "$DOMAIN" > "$WORK_DIR/bootstrap-domain"
+  install -m 640 -o root -g hysteria "$WORK_DIR/bootstrap-domain" /etc/hysteria/.bootstrap-domain
+  mv -f /etc/hysteria/.bootstrap-domain /etc/hysteria/bootstrap-domain
   ROLLBACK_HYSTERIA=0
   print_summary
 }
