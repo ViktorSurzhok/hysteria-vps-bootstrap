@@ -1,0 +1,30 @@
+name: Bootstrap checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  static:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash -n setup-hysteria.sh tests/integration.sh
+      - run: shellcheck setup-hysteria.sh tests/integration.sh
+      - run: python3 -m unittest discover -s tests -v
+  integration:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+        ipv6: [0, 1]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install and rerun on a disposable VM
+        env:
+          TEST_IPV6: ${{ matrix.ipv6 }}
+        run: sudo -E bash tests/integration.sh

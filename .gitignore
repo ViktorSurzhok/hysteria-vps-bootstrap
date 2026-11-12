@@ -22,3 +22,7 @@ secrets.txt
 # Local files
 *.local
 notes.md
+
+# Python regression tests
+__pycache__/
+*.pyc

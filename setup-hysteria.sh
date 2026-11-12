@@ -1,284 +1,343 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
-#
-# hysteria-vps-bootstrap — production-grade bootstrap for Hysteria 2 + Nginx + LE.
-# See README.md for documentation. Run with --help for CLI usage.
-#
+# Standalone Debian/Ubuntu bootstrap for Hysteria 2, nginx and Let's Encrypt.
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 SCRIPT_NAME="hysteria-vps-bootstrap"
-HYSTERIA_INSTALLER_URL="https://get.hy2.sh/"
-
-# ---------- colors / logging ----------
-if [[ -t 1 ]]; then
-  RED=$'\033[0;31m'; GRN=$'\033[0;32m'; YLW=$'\033[1;33m'; BLU=$'\033[0;34m'; NC=$'\033[0m'
-else
-  RED=""; GRN=""; YLW=""; BLU=""; NC=""
-fi
-
-log()  { printf '%s[INFO]%s %s\n' "$GRN" "$NC" "$*"; }
-warn() { printf '%s[WARN]%s %s\n' "$YLW" "$NC" "$*"; }
-err()  { printf '%s[ERR ]%s %s\n' "$RED" "$NC" "$*" >&2; }
-die()  { err "$*"; exit 1; }
-
-mask_secret() {
-  local s="${1:-}"
-  local n=${#s}
-  if (( n == 0 )); then printf '(empty)'; return; fi
-  if (( n <= 4 )); then printf '****'; return; fi
-  printf '%s***%s' "${s:0:2}" "${s: -2}"
-}
-
-# HTML-escape for values interpolated into the status page template.
-html_escape() {
-  local s="${1:-}"
-  s="${s//&/&amp;}"
-  s="${s//</&lt;}"
-  s="${s//>/&gt;}"
-  s="${s//\"/&quot;}"
-  s="${s//\'/&#39;}"
-  printf '%s' "$s"
-}
-
-# ---------- defaults / state ----------
-DOMAIN=""
-EMAIL=""
-PASSWORD=""
-PASSWORD_FILE=""
-PORT="8443"
-WEBROOT=""
+HYSTERIA_INSTALLER_URL="https://raw.githubusercontent.com/apernet/hysteria/master/scripts/install_server.sh"
+DOMAIN="" EMAIL="" PASSWORD="" PASSWORD_FILE="" PORT="8443" WEBROOT=""
 SITE_TITLE="Инфраструктурный узел активен."
-CERT_MODE="copy"        # copy | acl
-FORCE_RENEW="0"
-ASSUME_YES="0"
-BACKUP_DIR=""
-HYSTERIA_CERT_PATH=""
-HYSTERIA_KEY_PATH=""
+CERT_MODE="copy" FORCE_RENEW=0 UFW_MODE="keep" SHOW_PASSWORD=0
+IPV6_AVAILABLE=0 BACKUP_DIR="" WORK_DIR="" PUBLIC_IP=""
+HYSTERIA_CERT_PATH="" HYSTERIA_KEY_PATH=""
+SSH_PORTS=()
+ROLLBACK_HYSTERIA=0 HYSTERIA_WAS_ACTIVE=0 HYSTERIA_WAS_ENABLED=0
 
-# ---------- error trap ----------
-on_error() {
-  local ec=$? line=$1
-  err "failed at line ${line} (exit ${ec})"
-  if [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR" ]]; then
-    err "previous configs backed up at: ${BACKUP_DIR}"
-    err "restore with: cp -a ${BACKUP_DIR}/nginx/. /etc/nginx/ && systemctl reload nginx"
-  fi
-  exit "$ec"
-}
-trap 'on_error $LINENO' ERR
+log() { printf '[INFO] %s\n' "$*"; }
+warn() { printf '[WARN] %s\n' "$*" >&2; }
+die() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
 
-# ---------- usage ----------
 usage() {
-  cat <<USAGE
+  cat <<EOF
 ${SCRIPT_NAME} ${SCRIPT_VERSION}
-
-Bootstrap Hysteria 2 + Nginx + Let's Encrypt on a clean Debian/Ubuntu VPS.
-
-Usage:
-  sudo bash $0 --domain <fqdn> --email <addr> [--password <pw> | --password-file <path>] [options]
-
-Required:
-  --domain <fqdn>           FQDN with an A record pointing to this VPS.
-  --email <addr>            Contact email for Let's Encrypt (use your own domain).
-  --password <pw>           Hysteria 2 auth password.  (visible in ps; prefer --password-file)
-  --password-file <path>    Read password from first line of file (chmod 600 recommended).
-
-Options:
-  --port <udp>              UDP port for Hysteria (default: 8443).
-  --webroot <path>          Site root (default: /var/www/<domain>).
-  --site-title <text>       Status page subtitle (HTML-escaped automatically).
-  --cert-mode <copy|acl>    How Hysteria reads LE certs (default: copy).
-                              copy: certbot deploy-hook copies certs to /etc/hysteria/certs.
-                              acl : POSIX ACL on /etc/letsencrypt/archive (cleaner, needs acl fs).
-  --force-renew             Force certbot to renew even if cert is valid > 30 days.
-  --yes                     Assume yes on non-fatal confirmations.
-  -h, --help                Show this help.
-  -V, --version             Show script version.
-
-Examples:
-  sudo bash $0 \\
-    --domain node.example.com \\
-    --email admin@example.com \\
-    --password-file /root/.hysteria.pw \\
-    --port 8443 --cert-mode acl
-USAGE
+Usage: sudo bash $0 --domain <fqdn> --email <addr> [options]
+  --password-file <path>  Password from first line (preferred for automation).
+  --password <value>      Password (visible in process arguments).
+                         If omitted, reuse existing password or prompt via /dev/tty.
+  --port <udp>           Hysteria UDP port (default 8443).
+  --webroot <path>       Absolute site path (default /var/www/<domain>).
+  --site-title <text>    Status page subtitle.
+  --cert-mode copy|acl   Certificate delivery (default copy).
+  --force-renew          Explicitly force certificate renewal.
+  --ufw keep|enable|skip Default keep: add web rules only if UFW is already active.
+  --ssh-port <tcp>       Additional SSH port to allow; repeatable.
+                         Required with --ufw enable if SSH cannot be detected.
+  --show-password        Include password in final output (default hidden).
+  --yes, -y              Accepted for compatibility; does not enable UFW.
+  --help, -h             Show help.
+  --version, -V          Show version.
+EOF
 }
 
-# ---------- arg parsing ----------
 parse_args() {
-  while [[ $# -gt 0 ]]; do
+  while (( $# )); do
     case "$1" in
-      --domain)        DOMAIN="${2:-}"; shift 2 ;;
-      --email)         EMAIL="${2:-}"; shift 2 ;;
-      --password)      PASSWORD="${2:-}"; shift 2 ;;
-      --password-file) PASSWORD_FILE="${2:-}"; shift 2 ;;
-      --port)          PORT="${2:-8443}"; shift 2 ;;
-      --webroot)       WEBROOT="${2:-}"; shift 2 ;;
-      --site-title)    SITE_TITLE="${2:-}"; shift 2 ;;
-      --cert-mode)     CERT_MODE="${2:-copy}"; shift 2 ;;
-      --force-renew)   FORCE_RENEW="1"; shift ;;
-      --yes|-y)        ASSUME_YES="1"; shift ;;
-      -V|--version)    echo "${SCRIPT_NAME} ${SCRIPT_VERSION}"; exit 0 ;;
-      -h|--help)       usage; exit 0 ;;
-      *)               die "unknown argument: $1 (see --help)" ;;
+      --domain|--email|--password|--password-file|--port|--webroot|--site-title|--cert-mode|--ufw|--ssh-port)
+        if (( $# < 2 )) || [[ -z "$2" || "$2" == --* ]]; then die "missing value for $1"; fi
+        case "$1" in
+          --domain) DOMAIN="$2" ;; --email) EMAIL="$2" ;;
+          --password) PASSWORD="$2" ;; --password-file) PASSWORD_FILE="$2" ;;
+          --port) PORT="$2" ;; --webroot) WEBROOT="$2" ;;
+          --site-title) SITE_TITLE="$2" ;; --cert-mode) CERT_MODE="$2" ;;
+          --ufw) UFW_MODE="$2" ;; --ssh-port) SSH_PORTS+=("$2") ;;
+        esac
+        shift 2 ;;
+      --force-renew) FORCE_RENEW=1; shift ;;
+      --show-password) SHOW_PASSWORD=1; shift ;;
+      --yes|-y) shift ;;
+      --help|-h) usage; exit 0 ;;
+      --version|-V) printf '%s %s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"; exit 0 ;;
+      *) die "unknown argument: $1 (see --help)" ;;
     esac
   done
 }
 
+valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
 validate_inputs() {
-  [[ -n "$DOMAIN" ]] || die "--domain is required"
-  [[ -n "$EMAIL"  ]] || die "--email is required"
-
-  # basic FQDN sanity: letters/digits/dots/hyphens, at least one dot, no leading/trailing dot.
-  [[ "$DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]] \
-    || die "--domain does not look like a valid FQDN: $DOMAIN"
-
-  [[ "$EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] \
-    || die "--email does not look valid: $EMAIL"
-
-  [[ "$PORT" =~ ^[0-9]+$ ]] || die "--port must be numeric"
-  (( PORT >= 1 && PORT <= 65535 )) || die "--port out of range: $PORT"
-
-  case "$CERT_MODE" in
-    copy|acl) ;;
-    *) die "--cert-mode must be 'copy' or 'acl'" ;;
-  esac
-
-  if [[ -n "$PASSWORD_FILE" ]]; then
-    [[ -r "$PASSWORD_FILE" ]] || die "--password-file not readable: $PASSWORD_FILE"
-    PASSWORD="$(head -n1 "$PASSWORD_FILE" | tr -d '\r\n')"
-    [[ -n "$PASSWORD" ]] || die "password file is empty: $PASSWORD_FILE"
-  fi
-
-  if [[ -z "$PASSWORD" ]]; then
-    # Read from /dev/tty directly so the prompt works even when stdin is
-    # busy (e.g. `curl … | sudo bash -s -- …`) or not a TTY.
-    if [[ -r /dev/tty && -w /dev/tty ]]; then
-      printf 'Hysteria password: ' >/dev/tty
-      IFS= read -r -s PASSWORD </dev/tty
-      printf '\n' >/dev/tty
-      [[ -n "$PASSWORD" ]] || die "empty password"
-    else
-      die "--password or --password-file is required (no TTY available for interactive prompt)"
-    fi
-  fi
-
-  [[ -z "$WEBROOT" ]] && WEBROOT="/var/www/${DOMAIN}"
-
-  log "version:  ${SCRIPT_VERSION}"
-  log "domain:   ${DOMAIN}"
-  log "email:    ${EMAIL}"
-  log "port:     ${PORT}/udp"
-  log "webroot:  ${WEBROOT}"
-  log "certmode: ${CERT_MODE}"
-  log "password: $(mask_secret "$PASSWORD")"
+  if ! [[ "$DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]] \
+    || (( ${#DOMAIN} > 253 )); then die "--domain must be a valid FQDN"; fi
+  DOMAIN="${DOMAIN,,}"
+  local label p
+  local -a labels
+  IFS=. read -r -a labels <<< "$DOMAIN"
+  for label in "${labels[@]}"; do (( ${#label} <= 63 )) || die "domain label too long"; done
+  [[ "$EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ && "$EMAIL" != -* ]] || die "invalid --email"
+  valid_port "$PORT" || die "--port must be between 1 and 65535"
+  PORT=$((10#$PORT))
+  for p in "${SSH_PORTS[@]}"; do valid_port "$p" || die "invalid --ssh-port"; done
+  case "$CERT_MODE" in copy|acl) ;; *) die "--cert-mode must be copy or acl" ;; esac
+  case "$UFW_MODE" in keep|enable|skip) ;; *) die "--ufw must be keep, enable or skip" ;; esac
+  [[ -z "$PASSWORD" || -z "$PASSWORD_FILE" ]] || die "use only one password option"
+  WEBROOT="${WEBROOT:-/var/www/$DOMAIN}"
+  # These values enter nginx and a root-owned renewal hook, so restrict metacharacters.
+  [[ "$WEBROOT" =~ ^/[A-Za-z0-9_./-]+$ && "$WEBROOT" != / && "$WEBROOT" != *'/../'* && "$WEBROOT" != */.. ]] \
+    || die "--webroot must be an absolute path without spaces, '..' or shell/nginx metacharacters"
 }
 
-# ---------- environment ----------
-require_root() {
-  (( EUID == 0 )) || die "run as root: sudo bash $0 ..."
+restore_package_policy() {
+  local policy=/usr/sbin/policy-rc.d saved=/usr/sbin/policy-rc.d.hysteria-backup
+  if [[ -f "$policy" ]] && grep -q '^# hysteria-bootstrap temporary policy$' "$policy"; then
+    rm -f "$policy"
+  fi
+  if [[ ! -e "$policy" && ! -L "$policy" && ( -e "$saved" || -L "$saved" ) ]]; then
+    mv "$saved" "$policy"
+  fi
+}
+cleanup() {
+  local rc=$?
+  trap - EXIT
+  if (( ROLLBACK_HYSTERIA )); then rollback_hysteria; fi
+  restore_package_policy
+  [[ -z "$WORK_DIR" ]] || rm -rf -- "$WORK_DIR"
+  exit "$rc"
+}
+on_error() {
+  local rc=$? line=$1
+  printf '[ERROR] failed at line %s (exit %s). Backup: %s\n' "$line" "$rc" "${BACKUP_DIR:-not created}" >&2
+  printf 'Diagnostics: nginx -t; journalctl -u nginx -u hysteria-server -n 50 --no-pager\n' >&2
+  exit "$rc"
 }
 
-detect_os() {
-  command -v apt-get >/dev/null 2>&1 || die "only apt-based systems (Debian/Ubuntu) are supported"
-  if [[ -r /etc/os-release ]]; then
-    # shellcheck disable=SC1091
-    . /etc/os-release
-    log "os: ${PRETTY_NAME:-unknown}"
+require_environment() {
+  (( EUID == 0 )) || die "run with sudo/root"
+  if [[ "$(uname -s)" != Linux ]] || ! command -v apt-get >/dev/null; then die "Debian/Ubuntu Linux required"; fi
+  [[ -d /run/systemd/system ]] || die "a running systemd is required"
+  command -v flock >/dev/null || die "install util-linux (flock) first"
+  exec 9>/run/lock/hysteria-vps-bootstrap.lock
+  flock -n 9 || die "another bootstrap is running"
+  umask 077
+  WORK_DIR="$(mktemp -d /tmp/hysteria-bootstrap.XXXXXX)"
+  trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM HUP
+  trap 'on_error $LINENO' ERR
+  restore_package_policy
+}
+
+backup_existing_configs() {
+  BACKUP_DIR="$(mktemp -d "/root/${SCRIPT_NAME}-backup-$(date +%Y%m%d-%H%M%S).XXXXXX")"
+  local dir
+  for dir in nginx hysteria; do
+    if [[ -d "/etc/$dir" ]]; then cp -a "/etc/$dir" "$BACKUP_DIR/$dir"; fi
+  done
+  mkdir -p "$BACKUP_DIR/letsencrypt-meta"
+  for dir in renewal renewal-hooks; do
+    if [[ -d "/etc/letsencrypt/$dir" ]]; then cp -a "/etc/letsencrypt/$dir" "$BACKUP_DIR/letsencrypt-meta/"; fi
+  done
+  if [[ -d /etc/systemd/system/hysteria-server.service.d ]]; then
+    cp -a /etc/systemd/system/hysteria-server.service.d "$BACKUP_DIR/"
   fi
+  log "backup: $BACKUP_DIR"
+}
+
+detect_ipv6() {
+  IPV6_AVAILABLE=0
+  [[ -r /proc/net/if_inet6 ]] && grep -q . /proc/net/if_inet6 || return 0
+  [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" != 1 ]] || return 0
+  if command -v python3 >/dev/null && python3 - <<'PY6'
+import socket
+try:
+    with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+        s.bind(('::', 0))
+except OSError:
+    raise SystemExit(1)
+PY6
+  then IPV6_AVAILABLE=1; fi
+}
+
+repair_ipv6_file() {
+  local file=$1 tmp
+  [[ -f "$file" ]] || return 0
+  # Only standalone wildcard IPv6 listeners. Never delete an inline server block.
+  if [[ -L "$file" ]]; then file="$(readlink -f "$file")"; fi
+  tmp="$(mktemp "${file}.hysteria.XXXXXX")"
+  cp -p "$file" "$tmp"
+  sed -E '/^[[:space:]]*listen[[:space:]]+\[::\]:[0-9]+[^;]*;[[:space:]]*(#.*)?$/d' "$file" > "$tmp"
+  if ! cmp -s "$file" "$tmp"; then mv -f "$tmp" "$file"; fi
+  rm -f "$tmp"
+}
+repair_nginx_ipv6() {
+  (( IPV6_AVAILABLE == 0 )) || return 0
+  repair_ipv6_file /etc/nginx/sites-available/default
+  repair_ipv6_file "/etc/nginx/sites-available/$DOMAIN"
 }
 
 install_base_packages() {
-  log "installing base packages..."
+  log "repairing package state and installing dependencies"
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  local pkgs=(curl wget ca-certificates nginx certbot python3-certbot-nginx jq dnsutils ufw openssl)
-  if [[ "$CERT_MODE" == "acl" ]]; then
-    pkgs+=(acl)
+  local apt_options=(-o DPkg::Lock::Timeout=120 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+  # Prevent nginx's postinst from starting its new IPv6 default before it is repaired.
+  # Other service requests are delegated to any original local policy.
+  local policy=/usr/sbin/policy-rc.d saved=/usr/sbin/policy-rc.d.hysteria-backup policy_tmp
+  [[ ! -e "$saved" && ! -L "$saved" ]] || die "unresolved package policy backup: $saved"
+  policy_tmp="$(mktemp /usr/sbin/.hysteria-policy.XXXXXX)"
+  cat > "$policy_tmp" <<'POLICY'
+#!/bin/sh
+# hysteria-bootstrap temporary policy
+case "${1:-}" in nginx|nginx.service) exit 101 ;; esac
+if [ -x /usr/sbin/policy-rc.d.hysteria-backup ]; then
+  exec /usr/sbin/policy-rc.d.hysteria-backup "$@"
+fi
+exit 0
+POLICY
+  chmod 755 "$policy_tmp"
+  if [[ -e "$policy" || -L "$policy" ]]; then mv "$policy" "$saved"; fi
+  mv -f "$policy_tmp" "$policy"
+  repair_nginx_ipv6
+  if ! dpkg --force-confdef --force-confold --configure -a; then
+    apt-get "${apt_options[@]}" -f install -y
+    dpkg --force-confdef --force-confold --configure -a
   fi
-  apt-get install -y "${pkgs[@]}"
+  apt-get "${apt_options[@]}" update
+  local pkgs=(ca-certificates curl nginx certbot dnsutils ufw openssl python3 python3-yaml iproute2 util-linux)
+  [[ "$CERT_MODE" != acl ]] || pkgs+=(acl)
+  apt-get "${apt_options[@]}" install -y "${pkgs[@]}"
+  detect_ipv6
+  repair_nginx_ipv6
+  restore_package_policy
+  nginx -t || die "nginx configuration is invalid; check unrelated sites (backup: $BACKUP_DIR)"
+  log "IPv6 listeners available: $IPV6_AVAILABLE"
+}
+
+read_existing_password() {
+  python3 - "$1" <<'PY_PASSWORD'
+import sys, yaml
+try:
+    with open(sys.argv[1]) as f:
+        c = yaml.safe_load(f)
+    a = c.get('auth', {})
+    if a.get('type') != 'password' or not isinstance(a.get('password'), str):
+        raise ValueError()
+except (OSError, yaml.YAMLError, AttributeError, ValueError):
+    raise SystemExit('Cannot safely reuse existing password; provide --password-file explicitly.')
+print(a['password'], end='')
+PY_PASSWORD
+}
+
+load_password() {
+  if [[ -n "$PASSWORD_FILE" ]]; then
+    [[ -f "$PASSWORD_FILE" && -r "$PASSWORD_FILE" ]] || die "password file is not readable"
+    IFS= read -r PASSWORD < "$PASSWORD_FILE" || [[ -n "$PASSWORD" ]]
+    PASSWORD="${PASSWORD%$'\r'}"
+  elif [[ -z "$PASSWORD" && -f /etc/hysteria/config.yaml ]]; then
+    PASSWORD="$(read_existing_password /etc/hysteria/config.yaml)"
+    log "reusing existing Hysteria password"
+  elif [[ -z "$PASSWORD" ]]; then
+    if { exec 3<>/dev/tty; } 2>/dev/null; then
+      printf 'Hysteria password: ' >&3
+      IFS= read -r -s PASSWORD <&3 || true
+      printf '\n' >&3
+      exec 3>&-
+    else die "no terminal; provide --password-file"; fi
+  fi
+  [[ -n "$PASSWORD" && "$PASSWORD" != *$'\n'* && "$PASSWORD" != *$'\r'* ]] || die "password must be nonempty and single-line"
 }
 
 get_public_ip() {
-  local ip
-  ip="$(curl -4 -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || true)"
-  if [[ -z "$ip" ]]; then
-    ip="$(curl -4 -fsSL --max-time 5 https://ifconfig.me 2>/dev/null || true)"
-  fi
-  printf '%s' "$ip"
+  curl -4 -fsS --connect-timeout 5 --max-time 10 https://api.ipify.org \
+    || curl -4 -fsS --connect-timeout 5 --max-time 10 https://ifconfig.me/ip
 }
-
 preflight_dns() {
-  log "checking DNS for ${DOMAIN}..."
-  local pub
-  pub="$(get_public_ip)"
-  [[ -n "$pub" ]] || die "cannot determine public IPv4 address (no network?)"
-
-  local -a a_records=()
-  mapfile -t a_records < <(dig +short A "$DOMAIN" @1.1.1.1 2>/dev/null | grep -E '^[0-9.]+$' || true)
-  if (( ${#a_records[@]} == 0 )); then
-    err "no A record found for ${DOMAIN}"
-    die  "set DNS A record to ${pub} and wait for propagation before re-running"
-  fi
-
-  local r match=0
-  for r in "${a_records[@]}"; do
-    [[ "$r" == "$pub" ]] && { match=1; break; }
-  done
-
-  if (( match == 0 )); then
-    err "DNS A record(s) for ${DOMAIN}: ${a_records[*]}"
-    err "this VPS public IPv4:        ${pub}"
-    die "A record does not point to this VPS; Certbot HTTP-01 will fail"
-  fi
-
-  log "DNS OK: ${DOMAIN} → ${pub}"
+  PUBLIC_IP="$(get_public_ip)"
+  local a aaaa
+  a="$(dig +time=3 +tries=2 +short A "$DOMAIN")"
+  aaaa="$(dig +time=3 +tries=2 +short AAAA "$DOMAIN")"
+  PUBLIC_IP="$PUBLIC_IP" A_RECORDS="$a" AAAA_RECORDS="$aaaa" IPV6_AVAILABLE="$IPV6_AVAILABLE" python3 - <<'PY_DNS'
+import ipaddress, json, os, subprocess
+public = ipaddress.IPv4Address(os.environ['PUBLIC_IP'])
+def records(value, version):
+    result = []
+    for line in value.splitlines():
+        try:
+            address = ipaddress.ip_address(line.strip())
+            if address.version == version:
+                result.append(address)
+        except ValueError:
+            pass  # dig +short can include CNAME names
+    return result
+v4 = records(os.environ['A_RECORDS'], 4)
+v6 = records(os.environ['AAAA_RECORDS'], 6)
+if not v4 or any(x != public for x in v4):
+    raise SystemExit('Every DNS A record must point to this VPS: ' + str(public))
+if v6:
+    if os.environ['IPV6_AVAILABLE'] != '1':
+        raise SystemExit('Remove the DNS AAAA record: IPv6 is unavailable on this VPS.')
+    local = json.loads(subprocess.check_output(['ip', '-j', '-6', 'addr', 'show', 'scope', 'global']))
+    addresses = {ipaddress.ip_address(a['local']) for i in local for a in i.get('addr_info', [])}
+    if any(a not in addresses for a in v6):
+        raise SystemExit('Every DNS AAAA record must be assigned to this VPS.')
+PY_DNS
+  log "DNS validated for $DOMAIN ($PUBLIC_IP); external firewall must allow HTTP-01 on TCP 80"
 }
 
-# ---------- backup ----------
-backup_existing_configs() {
-  BACKUP_DIR="/root/${SCRIPT_NAME}-backup-$(date +%Y%m%d-%H%M%S)"
-  mkdir -p "$BACKUP_DIR"
-  if [[ -d /etc/nginx ]]; then
-    cp -a /etc/nginx "$BACKUP_DIR/nginx"
+discover_ssh_ports() {
+  local port config
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    read -r _ _ _ port <<< "$SSH_CONNECTION"
+    valid_port "$port" || die "invalid SSH_CONNECTION server port"
+    SSH_PORTS+=("$port")
   fi
-  if [[ -d /etc/hysteria ]]; then
-    cp -a /etc/hysteria "$BACKUP_DIR/hysteria"
+  if command -v sshd >/dev/null; then
+    config="$(sshd -T 2>/dev/null)" || die "cannot read sshd configuration; fix sshd -T before enabling UFW"
+    while read -r port; do [[ -z "$port" ]] || SSH_PORTS+=("$port"); done < <(awk '$1 == "port" {print $2}' <<< "$config")
   fi
-  if [[ -d /etc/letsencrypt ]]; then
-    # metadata only; skip archive/ to save space and avoid key duplication
-    mkdir -p "$BACKUP_DIR/letsencrypt-meta"
-    [[ -d /etc/letsencrypt/renewal ]] && cp -a /etc/letsencrypt/renewal "$BACKUP_DIR/letsencrypt-meta/"
-    [[ -d /etc/letsencrypt/renewal-hooks ]] && cp -a /etc/letsencrypt/renewal-hooks "$BACKUP_DIR/letsencrypt-meta/"
+  # Include actual listeners (socket-activated sshd may differ from sshd_config).
+  while read -r port; do [[ -z "$port" ]] || SSH_PORTS+=("$port"); done < <(
+    ss -H -ltnp | awk '/"sshd"|"sshd-session"/ {n=split($4,a,":"); print a[n]}')
+  if systemctl is-active --quiet ssh.socket; then
+    while read -r port; do [[ -z "$port" ]] || SSH_PORTS+=("$port"); done < <(
+      systemctl show ssh.socket -p Listen --value | grep -oE '[0-9]+ \(Stream\)' | awk '{print $1}')
   fi
-  log "existing configs backed up to: ${BACKUP_DIR}"
+  (( ${#SSH_PORTS[@]} )) || die "cannot determine SSH ports; pass --ssh-port before --ufw enable"
+  for port in "${SSH_PORTS[@]}"; do valid_port "$port" || die "invalid detected SSH port"; done
 }
-
-# ---------- firewall ----------
 configure_firewall() {
-  log "configuring ufw..."
-  ufw allow 22/tcp   comment 'ssh'   >/dev/null
-  ufw allow 80/tcp   comment 'http'  >/dev/null
-  ufw allow 443/tcp  comment 'https' >/dev/null
-  ufw allow "${PORT}/udp" comment 'hysteria' >/dev/null
-
-  # Verify the SSH rule is queued before enabling — if we lose SSH here, recovery is painful.
-  if ! ufw show added 2>/dev/null | grep -qE "allow +22/tcp"; then
-    die "ufw rule for 22/tcp was not queued; refusing to enable firewall"
+  [[ "$UFW_MODE" != skip ]] || { log "UFW unchanged (--ufw skip)"; return; }
+  local status port
+  status="$(LC_ALL=C ufw status)" || die "cannot determine UFW status"
+  if [[ "$status" != *'Status: active'* && "$UFW_MODE" == keep ]]; then
+    log "UFW is inactive; leaving it inactive (use --ufw enable to opt in)"
+    return
   fi
-
-  ufw --force enable >/dev/null
-  log "ufw enabled with rules: 22/tcp, 80/tcp, 443/tcp, ${PORT}/udp"
+  if [[ "$UFW_MODE" == enable && "$status" != *'Status: active'* ]]; then
+    discover_ssh_ports
+    # UFW skips duplicate allows even when they are below a deny. Only while
+    # inactive, remove the exact generic rule and prepend it before activation.
+    # Never remove a live SSH rule or reset rules/default policies.
+    for port in "${SSH_PORTS[@]}"; do
+      ufw --force delete allow "$((10#$port))/tcp"
+      ufw prepend allow "$((10#$port))/tcp" comment 'hysteria-bootstrap SSH'
+    done
+  fi
+  ufw allow 80/tcp comment 'hysteria-bootstrap HTTP'
+  ufw allow 443/tcp comment 'hysteria-bootstrap HTTPS'
+  ufw allow "$PORT/udp" comment 'hysteria-bootstrap QUIC'
+  if [[ "$UFW_MODE" == enable && "$status" != *'Status: active'* ]]; then ufw --force enable; fi
 }
 
-# ---------- nginx: HTTP (pre-LE) ----------
-write_http_site() {
-  log "writing HTTP vhost for ACME challenge..."
+html_escape() {
+  local s="${1:-}"
+  s="${s//&/\&amp;}"; s="${s//</\&lt;}"; s="${s//>/\&gt;}"
+  s="${s//\"/\&quot;}"; s="${s//\'/\&#39;}"
+  printf '%s' "$s"
+}
+write_status_page() {
   install -d -m 755 "$WEBROOT"
-
+  # Preserve an existing site's content on repeat runs.
+  [[ ! -e "$WEBROOT/index.html" ]] || return 0
   local public_ip generated_at
-  public_ip="$(get_public_ip)"
+  public_ip="$PUBLIC_IP"
   generated_at="$(date '+%Y-%m-%d %H:%M:%S %Z')"
 
   local e_domain e_title e_ip e_gen e_port
@@ -345,380 +404,387 @@ write_http_site() {
 </body>
 </html>
 EOF
+  chmod 644 "$WEBROOT/index.html"
+}
 
-  cat > "/etc/nginx/sites-available/${DOMAIN}" <<EOF
+certificate_usable() {
+  local dir="/etc/letsencrypt/live/$DOMAIN" days=${1:-0} cert_pub key_pub
+  [[ -r "$dir/fullchain.pem" && -r "$dir/privkey.pem" ]] || return 1
+  openssl x509 -in "$dir/fullchain.pem" -noout -checkend "$((days * 86400))" >/dev/null 2>&1 || return 1
+  openssl x509 -in "$dir/fullchain.pem" -noout -checkhost "$DOMAIN" >/dev/null 2>&1 || return 1
+  cert_pub="$(openssl x509 -in "$dir/fullchain.pem" -pubkey -noout)" || return 1
+  key_pub="$(openssl pkey -in "$dir/privkey.pem" -pubout)" || return 1
+  [[ "$cert_pub" == "$key_pub" ]]
+}
+
+render_nginx_site() {
+  local tls=$1 v6_http="" v6_https=""
+  if (( IPV6_AVAILABLE )); then v6_http='listen [::]:80;'; v6_https='listen [::]:443 ssl http2;'; fi
+  cat <<EOF
+# Managed by hysteria-vps-bootstrap for $DOMAIN
 server {
     listen 80;
-    listen [::]:80;
-    server_name ${DOMAIN};
-
-    root ${WEBROOT};
+    $v6_http
+    server_name $DOMAIN;
+    root $WEBROOT;
     index index.html;
-
-    location /.well-known/acme-challenge/ { allow all; }
-    location / { try_files \$uri \$uri/ =404; }
-}
+    location ^~ /.well-known/acme-challenge/ { try_files \$uri =404; }
 EOF
-
-  ln -sf "/etc/nginx/sites-available/${DOMAIN}" "/etc/nginx/sites-enabled/${DOMAIN}"
-  rm -f /etc/nginx/sites-enabled/default
-
-  nginx -t
-  systemctl enable nginx >/dev/null 2>&1 || true
-  systemctl restart nginx
+  if [[ "$tls" == 1 ]]; then
+    cat <<EOF
+    location / { return 301 https://$DOMAIN\$request_uri; }
 }
-
-# ---------- certbot ----------
-cert_valid_for_days() {
-  local pem="$1" days="$2"
-  openssl x509 -checkend $((days * 86400)) -noout -in "$pem" >/dev/null 2>&1
-}
-
-issue_certificate() {
-  local live="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
-
-  if [[ "$FORCE_RENEW" != "1" && -f "$live" ]] && cert_valid_for_days "$live" 30; then
-    log "existing LE certificate is valid >30 days — skipping issuance"
-    return 0
-  fi
-
-  log "requesting Let's Encrypt certificate (HTTP-01 via nginx)..."
-  certbot --nginx \
-    -d "$DOMAIN" \
-    --non-interactive \
-    --agree-tos \
-    -m "$EMAIL" \
-    --redirect \
-    --keep-until-expiring
-}
-
-# ---------- nginx: HTTPS (post-LE, hardened) ----------
-write_https_site() {
-  log "writing hardened HTTPS vhost..."
-  cat > "/etc/nginx/sites-available/${DOMAIN}" <<EOF
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${DOMAIN};
-    return 301 https://\$host\$request_uri;
-}
-
 server {
     listen 443 ssl http2;
-    listen [::]:443 ssl http2;
-    server_name ${DOMAIN};
-
-    root ${WEBROOT};
+    $v6_https
+    server_name $DOMAIN;
+    root $WEBROOT;
     index index.html;
-
-    ssl_certificate     /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
-    ssl_trusted_certificate /etc/letsencrypt/live/${DOMAIN}/chain.pem;
-
-    # Modern TLS: TLS 1.2+1.3 only, AEAD ciphers, no session tickets.
+    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_prefer_server_ciphers off;
-    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
-    ssl_session_cache shared:SSL:10m;
+    ssl_session_cache shared:HysteriaSSL:10m;
     ssl_session_timeout 1d;
     ssl_session_tickets off;
-
-    # OCSP stapling
-    ssl_stapling on;
-    ssl_stapling_verify on;
-    resolver 1.1.1.1 8.8.8.8 valid=300s ipv6=off;
-    resolver_timeout 5s;
-
-    # Security headers
-    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+    add_header Strict-Transport-Security "max-age=31536000" always;
     add_header X-Content-Type-Options nosniff always;
     add_header X-Frame-Options DENY always;
     add_header Referrer-Policy no-referrer always;
-    add_header Permissions-Policy "interest-cohort=()" always;
-
-    location /.well-known/acme-challenge/ { allow all; }
-    location / { try_files \$uri \$uri/ =404; }
+EOF
+  fi
+  cat <<'EOF'
+    location / { try_files $uri $uri/ =404; }
 }
 EOF
-
-  nginx -t
-  systemctl reload nginx
 }
 
-# ---------- hysteria install ----------
-install_hysteria() {
-  if command -v hysteria >/dev/null 2>&1; then
-    log "hysteria already installed: $(hysteria version 2>/dev/null | head -n1 || echo unknown)"
-    return 0
+write_nginx_site() {
+  local tls=$1 target="/etc/nginx/sites-available/$DOMAIN" link="/etc/nginx/sites-enabled/$DOMAIN"
+  local old="$WORK_DIR/nginx.previous" had_old=0 had_link=0
+  [[ ! -L "$target" ]] || die "refusing to overwrite symlink $target"
+  if [[ -e "$target" ]]; then cp -a "$target" "$old"; had_old=1; fi
+  if [[ -e "$link" || -L "$link" ]]; then
+    [[ -L "$link" && "$(readlink -f "$link")" == "$target" ]] || die "unexpected nginx site link: $link"
+    had_link=1
   fi
-
-  log "installing Hysteria 2 via upstream installer..."
-  local tmp
-  tmp="$(mktemp)"
-  # Upstream installer is fetched to a file so we can sanity-check it before exec.
-  curl -fsSL --max-time 30 "$HYSTERIA_INSTALLER_URL" -o "$tmp"
-  [[ -s "$tmp" ]] || { rm -f "$tmp"; die "empty installer from $HYSTERIA_INSTALLER_URL"; }
-  head -n1 "$tmp" | grep -q '^#!' || { rm -f "$tmp"; die "installer is not a shell script"; }
-  bash "$tmp"
-  rm -f "$tmp"
-
-  command -v hysteria >/dev/null 2>&1 || die "hysteria binary missing after install"
-  id -u hysteria >/dev/null 2>&1 || die "system user 'hysteria' not created by installer"
-  log "hysteria installed: $(hysteria version 2>/dev/null | head -n1 || echo unknown)"
-}
-
-# ---------- cert delivery: copy mode ----------
-setup_certs_copy() {
-  log "cert-mode=copy: mirroring LE certs into /etc/hysteria/certs"
-  local le="/etc/letsencrypt/live/${DOMAIN}"
-  [[ -r "${le}/fullchain.pem" && -r "${le}/privkey.pem" ]] \
-    || die "LE cert files missing at ${le}"
-
-  install -d -m 755 /etc/hysteria/certs
-  cp -f "${le}/fullchain.pem" /etc/hysteria/certs/fullchain.pem
-  cp -f "${le}/privkey.pem"   /etc/hysteria/certs/privkey.pem
-  chown -R hysteria:hysteria  /etc/hysteria/certs
-  chmod 755 /etc/hysteria
-  chmod 755 /etc/hysteria/certs
-  chmod 640 /etc/hysteria/certs/fullchain.pem
-  chmod 640 /etc/hysteria/certs/privkey.pem
-
-  install_certbot_deploy_hook_copy
-  HYSTERIA_CERT_PATH="/etc/hysteria/certs/fullchain.pem"
-  HYSTERIA_KEY_PATH="/etc/hysteria/certs/privkey.pem"
-}
-
-install_certbot_deploy_hook_copy() {
-  log "installing certbot deploy-hook (refresh cert copies on renewal)..."
-  install -d -m 755 /etc/letsencrypt/renewal-hooks/deploy
-  local hook="/etc/letsencrypt/renewal-hooks/deploy/hysteria-sync-${DOMAIN}.sh"
-  cat > "$hook" <<HOOK
-#!/bin/sh
-set -eu
-if [ "\${RENEWED_LINEAGE:-}" != "/etc/letsencrypt/live/${DOMAIN}" ]; then
-  exit 0
-fi
-LE="/etc/letsencrypt/live/${DOMAIN}"
-[ -r "\${LE}/fullchain.pem" ] && [ -r "\${LE}/privkey.pem" ] || exit 1
-install -d -m 755 /etc/hysteria/certs
-cp -f "\${LE}/fullchain.pem" /etc/hysteria/certs/fullchain.pem
-cp -f "\${LE}/privkey.pem"   /etc/hysteria/certs/privkey.pem
-chown -R hysteria:hysteria   /etc/hysteria/certs
-chmod 640 /etc/hysteria/certs/fullchain.pem /etc/hysteria/certs/privkey.pem
-systemctl reload-or-restart hysteria-server
-HOOK
-  chmod +x "$hook"
-}
-
-# ---------- cert delivery: ACL mode ----------
-setup_certs_acl() {
-  log "cert-mode=acl: granting hysteria user read access via POSIX ACL"
-
-  if ! command -v setfacl >/dev/null 2>&1; then
-    warn "setfacl not available; falling back to copy mode"
-    CERT_MODE="copy"; setup_certs_copy; return
+  render_nginx_site "$tls" > "$WORK_DIR/nginx.candidate"
+  install -m 644 "$WORK_DIR/nginx.candidate" "$target"
+  ln -sfn "$target" "$link"
+  if nginx -t && systemctl reload-or-restart nginx; then
+    systemctl enable nginx >/dev/null
+    return
   fi
+  if (( had_old )); then cp -a "$old" "$target"; else rm -f "$target"; fi
+  if (( ! had_link )); then rm -f "$link"; fi
+  if nginx -t; then systemctl reload-or-restart nginx || true; fi
+  die "nginx activation failed; previous site restored"
+}
 
-  # Probe whether the filesystem actually supports ACLs for our target path.
-  local probe="/etc/letsencrypt/.hysteria-acl-probe.$$"
-  : > "$probe" 2>/dev/null || { warn "cannot write probe; falling back to copy mode"; CERT_MODE="copy"; setup_certs_copy; return; }
-  if ! setfacl -m u:hysteria:r "$probe" 2>/dev/null; then
-    rm -f "$probe"
-    warn "filesystem does not support POSIX ACL on /etc/letsencrypt; falling back to copy mode"
-    CERT_MODE="copy"; setup_certs_copy; return
-  fi
-  rm -f "$probe"
 
-  # Traverse bit on each directory in the chain. 'x' without 'r' = can enter, cannot list.
-  setfacl -m u:hysteria:x /etc/letsencrypt/live
-  setfacl -m u:hysteria:x /etc/letsencrypt/archive
-  setfacl -m u:hysteria:x "/etc/letsencrypt/live/${DOMAIN}"
-  setfacl -m u:hysteria:x "/etc/letsencrypt/archive/${DOMAIN}"
+validate_existing_lineage() {
+  [[ ! -f "/etc/letsencrypt/renewal/$DOMAIN.conf" || "$FORCE_RENEW" == 1 ]] && return 0
+  DOMAIN="$DOMAIN" WEBROOT="$WEBROOT" python3 - <<'PY_LINEAGE'
+import os
+from pathlib import Path
+e = os.environ
+settings = {}; mapping = {}; in_map = False
+for line in Path('/etc/letsencrypt/renewal/' + e['DOMAIN'] + '.conf').read_text().splitlines():
+    line = line.strip()
+    if line.startswith('['):
+        in_map = line == '[[webroot_map]]'
+    elif '=' in line:
+        k, v = line.split('=', 1)
+        (mapping if in_map else settings)[k.strip()] = v.strip().strip(',').strip('"\'')
+if settings.get('authenticator') == 'webroot':
+    root = mapping.get(e['DOMAIN'], settings.get('webroot_path'))
+    if root != e['WEBROOT']:
+        raise SystemExit('Existing renewal uses another webroot. Keep that path or use --force-renew to update it.')
+PY_LINEAGE
+}
 
-  # Read bit on every existing versioned cert file.
-  local f
-  for f in /etc/letsencrypt/archive/"${DOMAIN}"/privkey*.pem \
-           /etc/letsencrypt/archive/"${DOMAIN}"/fullchain*.pem \
-           /etc/letsencrypt/archive/"${DOMAIN}"/chain*.pem \
-           /etc/letsencrypt/archive/"${DOMAIN}"/cert*.pem; do
-    [[ -f "$f" ]] && setfacl -m u:hysteria:r "$f"
+begin_hysteria_transaction() {
+  local snapshot="$WORK_DIR/hysteria-transaction"
+  mkdir -p "$snapshot/hooks"
+  cp -a /etc/hysteria "$snapshot/hysteria"
+  local hook
+  for hook in hysteria-bootstrap.sh "hysteria-sync-$DOMAIN.sh" "hysteria-reload-$DOMAIN.sh"; do
+    if [[ -e "/etc/letsencrypt/renewal-hooks/deploy/$hook" ]]; then
+      cp -a "/etc/letsencrypt/renewal-hooks/deploy/$hook" "$snapshot/hooks/"
+    fi
   done
-
-  # Default ACL — applies to files created by future certbot renewals.
-  setfacl -d -m u:hysteria:r "/etc/letsencrypt/archive/${DOMAIN}"
-
-  # Ground truth: can hysteria actually read the live symlinks?
-  if ! sudo -u hysteria test -r "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" \
-     || ! sudo -u hysteria test -r "/etc/letsencrypt/live/${DOMAIN}/privkey.pem"; then
-    err "ACL verification failed: hysteria user cannot read LE certs"
-    warn "falling back to copy mode"
-    CERT_MODE="copy"; setup_certs_copy; return
+  if [[ -f /etc/systemd/system/hysteria-server.service.d/bootstrap.conf ]]; then
+    cp -a /etc/systemd/system/hysteria-server.service.d/bootstrap.conf "$snapshot/bootstrap.conf"
   fi
+  if systemctl is-active --quiet hysteria-server; then HYSTERIA_WAS_ACTIVE=1; fi
+  if systemctl is-enabled --quiet hysteria-server; then HYSTERIA_WAS_ENABLED=1; fi
+  ROLLBACK_HYSTERIA=1
+}
+rollback_hysteria() {
+  warn "restoring Hysteria config, certificate copies, renewal hooks and service state"
+  local snapshot="$WORK_DIR/hysteria-transaction" hook
+  systemctl stop hysteria-server || true
+  cp -a "$snapshot/hysteria/." /etc/hysteria/
+  if [[ ! -f "$snapshot/hysteria/config.yaml" ]]; then rm -f /etc/hysteria/config.yaml; fi
+  if [[ ! -f "$snapshot/hysteria/bootstrap-domain" ]]; then rm -f /etc/hysteria/bootstrap-domain; fi
+  rm -f /etc/hysteria/.bootstrap-domain
+  for hook in hysteria-bootstrap.sh "hysteria-sync-$DOMAIN.sh" "hysteria-reload-$DOMAIN.sh"; do
+    rm -f "/etc/letsencrypt/renewal-hooks/deploy/$hook"
+    if [[ -f "$snapshot/hooks/$hook" ]]; then cp -a "$snapshot/hooks/$hook" /etc/letsencrypt/renewal-hooks/deploy/; fi
+  done
+  rm -f /etc/systemd/system/hysteria-server.service.d/bootstrap.conf
+  if [[ -f "$snapshot/bootstrap.conf" ]]; then cp -a "$snapshot/bootstrap.conf" /etc/systemd/system/hysteria-server.service.d/; fi
+  systemctl daemon-reload || true
+  if (( ! HYSTERIA_WAS_ENABLED )); then systemctl disable hysteria-server || true; fi
+  if (( HYSTERIA_WAS_ACTIVE )); then systemctl start hysteria-server || true; fi
+}
 
-  # In ACL mode we still install a minimal deploy-hook that only reloads hysteria.
+issue_certificate() {
+  local live="/etc/letsencrypt/live/$DOMAIN"
+  # Refuse to replace an unrelated/mismatched lineage implicitly.
+  if [[ -e "$live/fullchain.pem" ]] && ! certificate_usable 0; then
+    openssl x509 -in "$live/fullchain.pem" -noout -checkhost "$DOMAIN" >/dev/null 2>&1 \
+      || die "existing certificate does not cover $DOMAIN; inspect the lineage before retrying"
+  fi
+  if [[ "$FORCE_RENEW" == 0 ]] && certificate_usable 30 && [[ -f "/etc/letsencrypt/renewal/$DOMAIN.conf" ]]; then
+    log "reusing certificate valid for more than 30 days"
+  else
+    local args=(certonly --webroot --webroot-path "$WEBROOT" --cert-name "$DOMAIN"
+      -d "$DOMAIN" --non-interactive --agree-tos --email "$EMAIL")
+    if [[ "$FORCE_RENEW" == 1 ]]; then args+=(--force-renewal); else args+=(--keep-until-expiring); fi
+    certbot "${args[@]}"
+  fi
+  certificate_usable 0 || die "certificate/key validation failed"
+  systemctl enable --now certbot.timer
+}
+
+install_hysteria() {
+  if ! command -v hysteria >/dev/null; then
+    log "installing Hysteria 2 from the official installer"
+    curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 "$HYSTERIA_INSTALLER_URL" -o "$WORK_DIR/install-hysteria.sh"
+    bash -n "$WORK_DIR/install-hysteria.sh"
+    HYSTERIA_USER=hysteria bash "$WORK_DIR/install-hysteria.sh"
+  fi
+  local version
+  version="$(hysteria version)"
+  grep -qE '^Version:[[:space:]]+v2\.' <<< "$version" || die "Hysteria 2 required; refusing to reuse a v1/unknown binary"
+  id hysteria >/dev/null || die "hysteria system user missing; repair upstream installation first"
+  [[ "$(systemctl show hysteria-server -p LoadState --value)" == loaded ]] || die "hysteria-server unit missing"
+  [[ "$(systemctl show hysteria-server -p User --value)" == hysteria ]] || die "hysteria-server must use the hysteria user"
+  [[ "$(systemctl show hysteria-server -p Group --value)" == hysteria ]] || die "hysteria-server must use the hysteria group"
+  install -d -m 750 -o root -g hysteria /etc/hysteria
+}
+
+install_certbot_deploy_hook() {
+  local hook=/etc/letsencrypt/renewal-hooks/deploy/hysteria-bootstrap.sh
   install -d -m 755 /etc/letsencrypt/renewal-hooks/deploy
-  local hook="/etc/letsencrypt/renewal-hooks/deploy/hysteria-reload-${DOMAIN}.sh"
-  cat > "$hook" <<HOOK
-#!/bin/sh
-set -eu
-if [ "\${RENEWED_LINEAGE:-}" != "/etc/letsencrypt/live/${DOMAIN}" ]; then
-  exit 0
+  # A single Hysteria service has one certificate source. Remove the two legacy
+  # hooks for this domain so copy/ACL transitions never leave competing hooks.
+  rm -f "/etc/letsencrypt/renewal-hooks/deploy/hysteria-sync-$DOMAIN.sh" \
+        "/etc/letsencrypt/renewal-hooks/deploy/hysteria-reload-$DOMAIN.sh"
+  {
+    printf '#!/usr/bin/env bash\nset -Eeuo pipefail\numask 077\n'
+    printf 'DOMAIN=%q\nCERT_MODE=%q\n' "$DOMAIN" "$CERT_MODE"
+    cat <<'HOOK'
+[[ "${RENEWED_LINEAGE:-}" == "/etc/letsencrypt/live/$DOMAIN" ]] || exit 0
+exec 8>/run/lock/hysteria-certificate.lock
+flock -w 120 8
+LE="$RENEWED_LINEAGE"
+openssl x509 -in "$LE/fullchain.pem" -noout -checkend 0 >/dev/null
+openssl x509 -in "$LE/fullchain.pem" -noout -checkhost "$DOMAIN" >/dev/null
+cert_pub="$(openssl x509 -in "$LE/fullchain.pem" -pubkey -noout)"
+key_pub="$(openssl pkey -in "$LE/privkey.pem" -pubout)"
+[[ "$cert_pub" == "$key_pub" ]] || { echo 'Certificate/key mismatch' >&2; exit 1; }
+if [[ "$CERT_MODE" == copy ]]; then
+  base=/etc/hysteria/certs
+  install -d -m 750 -o root -g hysteria "$base"
+  release="$(mktemp -d "$base/release.XXXXXX")"
+  chown root:hysteria "$release"
+  chmod 750 "$release"
+  install -m 640 -o root -g hysteria "$LE/fullchain.pem" "$release/fullchain.pem"
+  install -m 640 -o root -g hysteria "$LE/privkey.pem" "$release/privkey.pem"
+  previous="$(readlink "$base/current" || true)"
+  ln -s "${release##*/}" "$base/.current.$$"
+  mv -Tf "$base/.current.$$" "$base/current"
+  # Keep the previous pair for recovery, prune only older generated releases.
+  for old in "$base"/release.*; do
+    [[ "$old" == "$release" || "${old##*/}" == "$previous" ]] || rm -rf -- "$old"
+  done
+  cert="$base/current/fullchain.pem"; key="$base/current/privkey.pem"
+else
+  # Reapply ACLs after renewal: chmod in Certbot may mask inherited permissions.
+  setfacl -m u:hysteria:x /etc/letsencrypt /etc/letsencrypt/live /etc/letsencrypt/archive \
+    "$LE" "/etc/letsencrypt/archive/$DOMAIN"
+  setfacl -m u:hysteria:r "$(readlink -f "$LE/fullchain.pem")" "$(readlink -f "$LE/privkey.pem")"
+  cert="$LE/fullchain.pem"; key="$LE/privkey.pem"
 fi
-systemctl reload-or-restart hysteria-server
+runuser -u hysteria -- test -r "$cert"
+runuser -u hysteria -- test -r "$key"
+if [[ "${HYSTERIA_BOOTSTRAP_SYNC_ONLY:-0}" != 1 ]]; then
+  nginx -t
+  if systemctl is-active --quiet nginx; then systemctl reload nginx; fi
+  # Do not start an intentionally stopped Hysteria service during renewal.
+  if systemctl is-active --quiet hysteria-server; then systemctl restart hysteria-server; fi
+fi
 HOOK
-  chmod +x "$hook"
-
-  HYSTERIA_CERT_PATH="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
-  HYSTERIA_KEY_PATH="/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
-  log "ACL mode active; hysteria reads certs directly from /etc/letsencrypt/live/${DOMAIN}"
+  } > "$WORK_DIR/deploy-hook"
+  bash -n "$WORK_DIR/deploy-hook"
+  install -m 700 "$WORK_DIR/deploy-hook" "$hook"
 }
 
 setup_hysteria_certs() {
-  case "$CERT_MODE" in
-    copy) setup_certs_copy ;;
-    acl)  setup_certs_acl  ;;
-  esac
+  if [[ "$CERT_MODE" == acl ]]; then
+    local probe
+    probe="$(mktemp /etc/letsencrypt/.acl-probe.XXXXXX)"
+    if ! setfacl -m u:hysteria:r "$probe"; then
+      warn "ACL unsupported; using copy mode"
+      CERT_MODE=copy
+    fi
+    rm -f "$probe"
+  fi
+  install_certbot_deploy_hook
+  if ! RENEWED_LINEAGE="/etc/letsencrypt/live/$DOMAIN" HYSTERIA_BOOTSTRAP_SYNC_ONLY=1 \
+      /etc/letsencrypt/renewal-hooks/deploy/hysteria-bootstrap.sh; then
+    if [[ "$CERT_MODE" == acl ]]; then
+      warn "ACL verification failed; using copy mode"
+      CERT_MODE=copy
+      install_certbot_deploy_hook
+      RENEWED_LINEAGE="/etc/letsencrypt/live/$DOMAIN" HYSTERIA_BOOTSTRAP_SYNC_ONLY=1 \
+        /etc/letsencrypt/renewal-hooks/deploy/hysteria-bootstrap.sh
+    else die "certificate delivery failed"; fi
+  fi
+  if [[ "$CERT_MODE" == copy ]]; then
+    HYSTERIA_CERT_PATH=/etc/hysteria/certs/current/fullchain.pem
+    HYSTERIA_KEY_PATH=/etc/hysteria/certs/current/privkey.pem
+  else
+    HYSTERIA_CERT_PATH="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+    HYSTERIA_KEY_PATH="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+  fi
 }
 
-# ---------- hysteria config ----------
+render_hysteria_config() {
+  PASSWORD="$PASSWORD" PORT="$PORT" IPV6_AVAILABLE="$IPV6_AVAILABLE" \
+    HYSTERIA_CERT_PATH="$HYSTERIA_CERT_PATH" HYSTERIA_KEY_PATH="$HYSTERIA_KEY_PATH" WEBROOT="$WEBROOT" python3 - <<'PY_CONFIG'
+import json, os
+e = os.environ
+# JSON is a YAML subset. Quotes, colons, hashes, booleans and Unicode passwords
+# round-trip exactly; the secret is never interpolated into shell/YAML syntax.
+print(json.dumps({
+    'listen': (':' if e['IPV6_AVAILABLE'] == '1' else '0.0.0.0:') + e['PORT'],
+    'tls': {'cert': e['HYSTERIA_CERT_PATH'], 'key': e['HYSTERIA_KEY_PATH']},
+    'auth': {'type': 'password', 'password': e['PASSWORD']},
+    'masquerade': {'type': 'file', 'file': {'dir': e['WEBROOT']}},
+}, ensure_ascii=False, indent=2))
+PY_CONFIG
+}
+
+udp_owned_by_hysteria() {
+  local pid
+  pid="$(systemctl show hysteria-server -p MainPID --value)"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  ss -H -lunp "sport = :$PORT" | grep -q "pid=$pid,"
+}
 write_hysteria_config() {
-  log "writing /etc/hysteria/config.yaml (password masked in logs)"
-  install -d -m 755 /etc/hysteria
-  local cfg="/etc/hysteria/config.yaml"
-  umask 077
-  cat > "$cfg" <<EOF
-listen: :${PORT}
-
-tls:
-  cert: ${HYSTERIA_CERT_PATH}
-  key: ${HYSTERIA_KEY_PATH}
-
-auth:
-  type: password
-  password: ${PASSWORD}
-
-resolver:
-  type: udp
-  udp:
-    addr: 1.1.1.1:53
-
-masquerade:
-  type: proxy
-  proxy:
-    url: https://${DOMAIN}
-    rewriteHost: true
-EOF
-  umask 022
-
-  chown root:hysteria "$cfg"
-  chmod 640 "$cfg"
-  log "config written: $cfg (owner root:hysteria, mode 640, password: $(mask_secret "$PASSWORD"))"
+  local cfg=/etc/hysteria/config.yaml candidate=/etc/hysteria/.bootstrap-candidate.yaml
+  local previous="$WORK_DIR/hysteria.previous" had_old=0 was_active=0
+  [[ ! -L "$cfg" ]] || die "refusing to overwrite symlink $cfg"
+  [[ ! -f "$cfg" ]] || { cp -a "$cfg" "$previous"; had_old=1; }
+  if systemctl is-active --quiet hysteria-server; then was_active=1; fi
+  render_hysteria_config > "$WORK_DIR/config.yaml"
+  install -m 640 -o root -g hysteria "$WORK_DIR/config.yaml" "$candidate"
+  # Hysteria has no 'check' subcommand. Validate using the real server on an
+  # ephemeral UDP port as its service user, before replacing the live config.
+  python3 - "$candidate" "$WORK_DIR/probe.json" <<'PY_PROBE'
+import json, sys
+with open(sys.argv[1]) as f:
+    c = json.load(f)
+c['listen'] = '127.0.0.1:0'
+with open(sys.argv[2], 'w') as f:
+    json.dump(c, f)
+PY_PROBE
+  install -m 640 -o root -g hysteria "$WORK_DIR/probe.json" /etc/hysteria/.bootstrap-probe.yaml
+  local rc=0
+  timeout 3 runuser -u hysteria -- hysteria server --config /etc/hysteria/.bootstrap-probe.yaml > "$WORK_DIR/probe.log" 2>&1 || rc=$?
+  rm -f /etc/hysteria/.bootstrap-probe.yaml
+  if [[ "$rc" != 124 ]] || ! grep -q 'server up and running' "$WORK_DIR/probe.log"; then
+    rm -f "$candidate"
+    die "Hysteria rejected the candidate configuration; existing config preserved"
+  fi
+  mv -f "$candidate" "$cfg"
+  local ok=0 i
+  if systemctl restart hysteria-server; then
+    for ((i=0; i<15; i++)); do
+      if systemctl is-active --quiet hysteria-server && udp_owned_by_hysteria; then ok=1; break; fi
+      sleep 1
+    done
+  fi
+  if (( ok )); then
+    systemctl enable hysteria-server >/dev/null
+    return
+  fi
+  if (( had_old )); then cp -a "$previous" "$cfg"; else rm -f "$cfg"; fi
+  systemctl stop hysteria-server || true
+  if (( was_active )); then systemctl start hysteria-server || true; fi
+  die "Hysteria startup failed; previous config restored (see journalctl -u hysteria-server)"
 }
 
 ensure_hysteria_restart_policy() {
-  log "installing systemd drop-in: Restart=always, RestartSec=5"
   install -d -m 755 /etc/systemd/system/hysteria-server.service.d
-  cat > /etc/systemd/system/hysteria-server.service.d/override.conf <<'EOF'
+  cat > /etc/systemd/system/hysteria-server.service.d/bootstrap.conf <<'UNIT'
 [Service]
-Restart=always
+Restart=on-failure
 RestartSec=5
-EOF
+UNIT
   systemctl daemon-reload
 }
 
-start_hysteria() {
-  log "starting hysteria-server..."
-  systemctl enable hysteria-server >/dev/null 2>&1 || true
-  systemctl restart hysteria-server
-  sleep 2
-}
-
-# ---------- verification ----------
 verify_services() {
-  log "verifying nginx..."
-  systemctl is-active --quiet nginx || die "nginx is not active"
-
-  log "verifying hysteria-server..."
-  if ! systemctl is-active --quiet hysteria-server; then
-    err "hysteria-server is not active"
-    journalctl -u hysteria-server -n 30 --no-pager -l || true
-    die "hysteria-server failed to start"
-  fi
-
-  log "verifying UDP listener on :${PORT}..."
-  if ! ss -ulnp 2>/dev/null | grep -q ":${PORT}"; then
-    err "no UDP listener on :${PORT}"
-    journalctl -u hysteria-server -n 30 --no-pager -l || true
-    ss -ulnp || true
-    die "hysteria is not listening"
-  fi
-
-  log "verifying cert access by hysteria user..."
-  if ! sudo -u hysteria test -r "$HYSTERIA_CERT_PATH" \
-     || ! sudo -u hysteria test -r "$HYSTERIA_KEY_PATH"; then
-    die "hysteria user cannot read TLS material at ${HYSTERIA_CERT_PATH}"
-  fi
-
-  log "verifying HTTPS responds locally..."
-  if ! curl -fsSI --max-time 5 "https://${DOMAIN}" >/dev/null 2>&1; then
-    warn "HTTPS probe to https://${DOMAIN} failed (DNS/firewall/propagation?)"
-  fi
-
-  log "all checks passed"
+  nginx -t
+  systemctl is-active --quiet nginx
+  systemctl is-active --quiet hysteria-server
+  udp_owned_by_hysteria || die "expected UDP socket is not owned by hysteria-server"
+  runuser -u hysteria -- test -r "$HYSTERIA_CERT_PATH"
+  runuser -u hysteria -- test -r "$HYSTERIA_KEY_PATH"
+  curl --noproxy '*' --resolve "$DOMAIN:443:127.0.0.1" -fsS --max-time 10 "https://$DOMAIN/" >/dev/null
+  log "local HTTPS, certificate access, Hysteria service and UDP owner verified"
 }
-
-# ---------- summary ----------
 print_summary() {
-  local public_ip
-  public_ip="$(get_public_ip)"
-
-  printf '\n%s==================== RESULT ====================%s\n' "$BLU" "$NC"
-  printf 'Script version:      %s\n' "$SCRIPT_VERSION"
-  printf 'Domain:              %s\n' "$DOMAIN"
-  printf 'Public IP:           %s\n' "${public_ip:-unknown}"
-  printf 'Website:             https://%s\n' "$DOMAIN"
-  printf 'Hysteria endpoint:   %s:%s/udp\n' "$DOMAIN" "$PORT"
-  printf 'TLS SNI:             %s\n' "$DOMAIN"
-  printf 'Cert mode:           %s\n' "$CERT_MODE"
-  printf 'Hysteria cert:       %s\n' "$HYSTERIA_CERT_PATH"
-  printf 'Hysteria key:        %s\n' "$HYSTERIA_KEY_PATH"
-  printf 'Config:              /etc/hysteria/config.yaml (mode 640, root:hysteria)\n'
-  printf 'Backup of old cfgs:  %s\n' "$BACKUP_DIR"
-  printf 'Password:            %s\n' "$PASSWORD"
-  printf '\nSuggested Surge / client node:\n'
-  printf '  Protocol:          Hysteria 2\n'
-  printf '  Server Address:    %s\n' "${public_ip:-$DOMAIN}"
-  printf '  Port:              %s\n' "$PORT"
-  printf '  Password:          %s\n' "$PASSWORD"
-  printf '  Custom TLS SNI:    %s\n' "$DOMAIN"
-  printf '\nUseful checks:\n'
-  printf '  systemctl status hysteria-server --no-pager -l\n'
-  printf '  journalctl -u hysteria-server -f --no-pager\n'
-  printf '  curl -I https://%s\n' "$DOMAIN"
-  printf '  ss -ulnp | grep :%s\n' "$PORT"
-  printf '%s================================================%s\n' "$BLU" "$NC"
+  printf '\nWebsite: https://%s\nHysteria 2: %s:%s/udp\nTLS SNI: %s\n' "$DOMAIN" "$DOMAIN" "$PORT" "$DOMAIN"
+  printf 'Config: /etc/hysteria/config.yaml (root:hysteria, 640)\nBackup: %s\n' "$BACKUP_DIR"
+  if (( SHOW_PASSWORD )); then printf 'Password: %s\n' "$PASSWORD"; else printf 'Password: hidden (existing password preserved; --show-password to display)\n'; fi
+  printf 'Check external connectivity from your client; provider firewall must allow TCP 80/443 and UDP %s.\n' "$PORT"
 }
 
 # ---------- main ----------
 main() {
   parse_args "$@"
   validate_inputs
-  require_root
-  detect_os
-  install_base_packages
-  preflight_dns
+  require_environment
   backup_existing_configs
+  detect_ipv6
+  install_base_packages
+  load_password
+  # One instance only: do not silently move an existing managed service to another domain.
+  if [[ -f /etc/hysteria/bootstrap-domain && "$(cat /etc/hysteria/bootstrap-domain)" != "$DOMAIN" ]]; then
+    die "this service is managed for another domain; migrate it explicitly"
+  fi
+  preflight_dns
   configure_firewall
-  write_http_site
+  validate_existing_lineage
+  write_status_page
+  if certificate_usable 0; then write_nginx_site 1; else write_nginx_site 0; fi
   issue_certificate
-  write_https_site
+  write_nginx_site 1
   install_hysteria
+  begin_hysteria_transaction
   setup_hysteria_certs
-  write_hysteria_config
   ensure_hysteria_restart_policy
-  start_hysteria
+  write_hysteria_config
   verify_services
+  printf '%s\n' "$DOMAIN" > "$WORK_DIR/bootstrap-domain"
+  install -m 640 -o root -g hysteria "$WORK_DIR/bootstrap-domain" /etc/hysteria/.bootstrap-domain
+  mv -f /etc/hysteria/.bootstrap-domain /etc/hysteria/bootstrap-domain
+  ROLLBACK_HYSTERIA=0
   print_summary
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then main "$@"; fi
